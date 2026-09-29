@@ -25586,6 +25586,179 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn wasm_parent_services_queued_python_requests_without_consuming_child_output() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let context = create_python_context_for_vm_test(
+                &sidecar,
+                &vm_id,
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../execution/assets/pyodide"),
+            );
+            let limits = {
+                let vm = sidecar.vms.get(&vm_id).expect("Python test VM");
+                agentos_execution::PythonExecutionLimits {
+                    reactor_work_quantum: Some(vm.limits.reactor.work_quantum),
+                    bridge_call_timeout_ms: Some(
+                        vm.limits
+                            .reactor
+                            .operation_deadline_ms
+                            .saturating_add(1_000),
+                    ),
+                    max_open_fds: vm.kernel.resource_limits().max_open_fds,
+                    ..Default::default()
+                }
+            };
+            let execution = start_python_execution_for_vm_test(
+                &sidecar,
+                &vm_id,
+                StartPythonExecutionRequest {
+                    guest_runtime: Default::default(),
+                    limits,
+                    vm_id: vm_id.clone(),
+                    context_id: context.context_id,
+                    code: String::from("print(42)"),
+                    file_path: None,
+                    env: BTreeMap::new(),
+                    cwd: temp_dir("agentos-wasm-parent-python-rpc"),
+                },
+            )
+            .expect("start Python execution");
+            let root_handle = create_kernel_process_handle_for_tests();
+            let mut root = active_process_for_tests(
+                root_handle.pid(),
+                root_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::HostFunction(HostFunctionExecution::default()),
+            );
+            let child_handle = create_kernel_process_handle_for_tests();
+            let mut child = active_process_for_tests(
+                child_handle.pid(),
+                child_handle,
+                GuestRuntimeKind::Python,
+                ActiveExecution::Python(execution),
+            );
+            // The WASM parent's poller requeues these events for the supervisor.
+            // Neither request may be stranded behind the WASM-parent guard.
+            child
+                .queue_pending_execution_event(ActiveExecutionEvent::PythonVfsRpcRequest(Box::new(
+                    PythonVfsRpcRequest {
+                        id: 1,
+                        method: PythonVfsRpcMethod::ReadDir,
+                        path: String::from("/"),
+                        destination: None,
+                        target: None,
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        atime_ms: None,
+                        mtime_ms: None,
+                        content_base64: None,
+                        recursive: false,
+                        url: None,
+                        http_method: None,
+                        headers: BTreeMap::new(),
+                        body_base64: None,
+                        hostname: None,
+                        family: None,
+                        port: None,
+                        socket_id: None,
+                        command: None,
+                        args: Vec::new(),
+                        argv0: None,
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        shell: false,
+                        max_buffer: None,
+                        timeout_ms: None,
+                    },
+                )))
+                .expect("queue Python filesystem request");
+            child
+                .queue_pending_execution_event(ActiveExecutionEvent::PythonSocketConnectCompletion(
+                    Box::new(crate::state::PythonSocketConnectCompletion {
+                        request_id: 2,
+                        result: Err(crate::state::DeferredRpcError {
+                            code: String::from("ECONNREFUSED"),
+                            message: String::from("test connection refused"),
+                        }),
+                    }),
+                ))
+                .expect("queue Python socket completion");
+            for event in [
+                ActiveExecutionEvent::Stdout(b"42\n".to_vec()),
+                ActiveExecutionEvent::Stderr(b"diagnostic\n".to_vec()),
+                ActiveExecutionEvent::Exited(0),
+            ] {
+                child
+                    .queue_pending_execution_event(event)
+                    .expect("queue shell-owned event");
+            }
+            root.child_processes
+                .insert(String::from("python-child"), child);
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("test vm")
+                .active_processes
+                .insert(String::from("wasm-root"), root);
+
+            let mut javascript_services = Vec::new();
+            let mut python_services = Vec::new();
+            let mut socket_completions = Vec::new();
+            let mut child_bridge_services = Vec::new();
+            // One claim per pump also checks that the second queued request
+            // makes progress on the next supervisor turn.
+            for _ in 0..2 {
+                sidecar
+                    .pump_child_process_events_nowait(
+                        &vm_id,
+                        &mut javascript_services,
+                        &mut python_services,
+                        &mut socket_completions,
+                        &mut child_bridge_services,
+                        2,
+                    )
+                    .expect("pump Python child requests");
+            }
+            assert_eq!(
+                python_services.len(),
+                1,
+                "supervisor must claim Python VFS request"
+            );
+            assert_eq!(
+                python_services[0].request.method,
+                PythonVfsRpcMethod::ReadDir
+            );
+            assert_eq!(python_services[0].child_path, ["python-child"]);
+            assert_eq!(
+                socket_completions.len(),
+                1,
+                "supervisor must claim Python socket completion"
+            );
+            assert_eq!(socket_completions[0].completion.request_id, 2);
+            assert!(javascript_services.is_empty());
+            assert!(child_bridge_services.is_empty());
+            assert!(sidecar.pending_process_events.is_empty());
+            let vm = sidecar.vms.get(&vm_id).expect("test vm");
+            let child = &vm.active_processes["wasm-root"].child_processes["python-child"];
+            let events = &child.pending_execution_events;
+            assert_eq!(events.len(), 3, "shell retains stdout, stderr, and exit");
+            assert!(matches!(&events[0], ActiveExecutionEvent::Stdout(bytes) if bytes == b"42\n"));
+            assert!(
+                matches!(&events[1], ActiveExecutionEvent::Stderr(bytes) if bytes == b"diagnostic\n")
+            );
+            assert!(matches!(&events[2], ActiveExecutionEvent::Exited(0)));
+        }
+
+        #[test]
         fn wasm_parent_child_write_deadline_wakes_after_parent_stops_polling() {
             assert_node_available();
 

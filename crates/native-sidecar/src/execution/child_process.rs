@@ -2769,7 +2769,26 @@ where
                     })
                     .unwrap_or(false);
                 if parent_is_pull_driven_wasm {
-                    continue;
+                    // The parent's poller requeues Python bridge events for
+                    // the supervisor. Service those requests even though the
+                    // parent still owns delivery of stdout, stderr, and exit.
+                    let queued_python_event = self.vms.get(vm_id).is_some_and(|vm| {
+                        vm.active_processes
+                            .get(process_id)
+                            .and_then(|root| Self::active_process_by_path(root, &parent_path))
+                            .and_then(|parent| parent.child_processes.get(&child_process_id))
+                            .and_then(|child| child.pending_execution_events.front())
+                            .is_some_and(|event| {
+                                matches!(
+                                    event,
+                                    ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                                        | ActiveExecutionEvent::PythonSocketConnectCompletion(_)
+                                )
+                            })
+                    });
+                    if !queued_python_event {
+                        continue;
+                    }
                 }
                 self.expire_child_process_sync_if_needed(
                     vm_id,
@@ -2783,7 +2802,7 @@ where
                     process_id,
                     &parent_path,
                     &child_process_id,
-                    false,
+                    parent_is_pull_driven_wasm,
                     javascript_services,
                     python_services,
                     python_socket_completions,
