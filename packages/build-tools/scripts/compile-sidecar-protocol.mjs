@@ -21,13 +21,9 @@ await mkdir(path.dirname(outputPath), { recursive: true });
 await writeFile(outputPath, output);
 
 function postProcess(code) {
-	code = code.replace(/@bare-ts\/lib/g, "@rivetkit/bare-ts");
 	code = code.replace(/^import assert from "assert"\n?/m, "");
 	code = code.replace(/^import assert from "node:assert"\n?/m, "");
 
-	if (code.includes("@bare-ts/lib")) {
-		throw new Error("failed to replace @bare-ts/lib import");
-	}
 	if (code.includes('import assert from "')) {
 		throw new Error("failed to remove generated assert import");
 	}

@@ -32,8 +32,8 @@ pub use diagnostics::{
 pub use frames::{
     authenticated_response, bound_udp_snapshot_response, event, layer_created_response,
     layer_sealed_response, listener_snapshot_response, mounts_listed_response,
-    overlay_created_response, package_linked_response, process_exited_event,
-    process_killed_response, process_output_event, process_snapshot_response,
+    overlay_created_response, package_linked_response, package_unlinked_response,
+    process_exited_event, process_killed_response, process_output_event, process_snapshot_response,
     process_started_response, provided_commands_response, reject, respond, response_with_ownership,
     root_filesystem_bootstrapped_response, root_filesystem_snapshot_response,
     session_opened_response, signal_state_response, snapshot_exported_response,
@@ -64,7 +64,7 @@ pub use identity::{shared_guest_runtime_identity, SharedGuestRuntimeIdentity};
 pub use layers::{VmLayerStore, MAX_VM_LAYERS};
 pub use limits::{
     validate_vm_limits, virtual_os_cpu_count, virtual_os_freemem_bytes, virtual_os_totalmem_bytes,
-    vm_limits_from_config, AcpLimits, HostFunctionLimits, HttpLimits, JsRuntimeLimits,
+    vm_limits_from_config, AgentOsPackageLimits, HostFunctionLimits, HttpLimits, JsRuntimeLimits,
     PluginLimits, PythonLimits, VmLimits, WasmLimits,
 };
 pub use net::{

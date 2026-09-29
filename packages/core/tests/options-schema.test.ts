@@ -6,12 +6,26 @@ import {
 } from "../src/sandbox.js";
 
 describe("AgentOsOptions validation", () => {
-	test("accepts the path-only actor runtime socket descriptor", () => {
+	test("accepts a complete initial environment including an explicit empty map", () => {
+		expect(agentOsOptionsSchema.safeParse({ environment: {} }).success).toBe(
+			true,
+		);
+		expect(
+			agentOsOptionsSchema.safeParse({
+				environment: { EMPTY: "", PATH: "/opt/agentos/bin" },
+			}).success,
+		).toBe(true);
+		expect(
+			agentOsOptionsSchema.safeParse({ environment: { PORT: 3000 } }).success,
+		).toBe(false);
+	});
+
+	test("accepts the temporary local SQLite descriptor", () => {
 		expect(
 			agentOsOptionsSchema.safeParse({
 				database: {
-					type: "actor_uds",
-					path: "/tmp/actor-runtime.sock",
+					type: "sqlite_file",
+					path: "/tmp/agentos.sqlite",
 				},
 			}).success,
 		).toBe(true);
@@ -23,8 +37,8 @@ describe("AgentOsOptions validation", () => {
 				rootFilesystem: {
 					type: "native",
 					plugin: {
-						id: "chunked_actor_sqlite",
-						config: { path: "/tmp/actor.sock" },
+						id: "chunked_sqlite",
+						config: { namespace: "root" },
 					},
 				},
 			}).success,
@@ -105,6 +119,54 @@ describe("AgentOsOptions validation", () => {
 				}).success,
 			).toBe(false);
 		}
+	});
+
+	test("accepts optional TLS/execution fields and validates TLS bytes", () => {
+		for (const limits of [
+			{ tls: {}, execution: {} },
+			{ tls: { maxBufferedBytes: 2048 } },
+		]) {
+			expect(agentOsOptionsSchema.parse({ limits }).limits).toEqual(limits);
+		}
+		for (const maxBufferedBytes of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(
+				agentOsOptionsSchema.safeParse({
+					limits: { tls: { maxBufferedBytes } },
+				}).success,
+			).toBe(false);
+		}
+		expect(
+			agentOsOptionsSchema.safeParse({
+				limits: { tls: { max_buffered_bytes: 2048 } },
+			}).success,
+		).toBe(false);
+		expect(
+			agentOsOptionsSchema.safeParse({
+				limits: { execution: { completedTtl: 60_000 } },
+			}).success,
+		).toBe(false);
+	});
+
+	test("accepts package mount limits and rejects invalid or unknown fields", () => {
+		for (const packages of [{}, { maxMounts: 8192 }]) {
+			expect(
+				agentOsOptionsSchema.safeParse({
+					limits: { agentosPackages: packages },
+				}).success,
+			).toBe(true);
+		}
+		for (const maxMounts of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(
+				agentOsOptionsSchema.safeParse({
+					limits: { agentosPackages: { maxMounts } },
+				}).success,
+			).toBe(false);
+		}
+		expect(
+			agentOsOptionsSchema.safeParse({
+				limits: { agentosPackages: { maxMount: 8 } },
+			}).success,
+		).toBe(false);
 	});
 	test("provider sandbox starts a client and owns disposal", async () => {
 		let disposed = false;

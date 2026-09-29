@@ -1,20 +1,19 @@
 ---
 title: "Introduction"
-description: "Run coding agents in isolated agentOS VMs with controlled filesystems, processes, networking, durable sessions, and Rivet Actor persistence."
+description: "Run isolated Linux-compatible VMs with agentOS Core."
 ---
 
-agentOS runs coding agents in lightweight, isolated VMs inside your process, with
-filesystem and process support, network controls, host functions, permissions,
-and orchestration built in.
+agentOS provides isolated filesystem, process, terminal, language, and networking
+APIs in a lightweight VM.
 
 <CardGroup>
   <Card title="Quickstart" href="/agentos/docs/quickstart">
-    Boot a VM and run your first coding agent.
+    Run a VM inside a trusted Node.js backend.
   </Card>
-  <Card title="Quickstart (Embedded)" href="/agentos/docs/quickstart-embedded">
-    Run agentOS directly inside an existing Node.js application.
-  </Card>
-  <Card title="Agents" href="/agentos/docs/agents/pi">
-    Run Pi, Claude Code, Codex, and OpenCode.
+  <Card title="Software" href="/agentos/docs/software">
+    Install immutable `.aospkg` command packages.
   </Card>
 </CardGroup>
+
+Core owns the VM process, lifecycle, and host bindings. Managed orchestration
+adapters are separate consumers of the same runtime APIs.

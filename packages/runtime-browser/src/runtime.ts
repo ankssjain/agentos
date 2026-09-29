@@ -135,14 +135,14 @@ export interface ExecOptions {
 	 * finishes and microtasks drain, the executor keeps the worker event loop alive
 	 * for async I/O (stdin events, timers, stream pumps) until the program calls
 	 * `process.exit` (or a safety timeout). Needed for long-running stdio servers such
-	 * as an ACP agent that reads requests and replies asynchronously. Default false
+	 * as a long-running program that reads requests and replies asynchronously. Default false
 	 * (run-to-completion).
 	 */
 	persistent?: boolean;
 	/**
 	 * Stream stdin: the host feeds stdin incrementally (`writeStdin`) and ends it
 	 * explicitly (`endStdin`) rather than the one-shot `stdin` string that auto-ends.
-	 * Pairs with `persistent` to drive a long-running stdio program (e.g. an ACP agent)
+	 * Pairs with `persistent` to drive a long-running stdio server
 	 * as a proper external client. Use `onStart` to learn the execution id.
 	 */
 	streamingStdin?: boolean;
@@ -1176,7 +1176,7 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 	process: "module.exports = globalThis.process;",
 	"node:process": "module.exports = globalThis.process;",
 	// node:module — createRequire returns the guest's kernel-backed require so guest
-	// programs (e.g. the pi ACP adapter) can build a require from import.meta.url.
+	// programs can build a require from import.meta.url.
 	module: `
 		const createRequire = () => globalThis.require;
 		const Module = { createRequire };
@@ -1236,7 +1236,7 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 		module.exports.default = module.exports;
 	`,
 	"node:tty": "module.exports = require('tty');",
-	// node:readline — stub interface (in ACP mode stdin is the protocol, not a REPL).
+	// node:readline — minimal stub interface for non-interactive browser execution.
 	readline: `
 		module.exports = {
 			createInterface: () => { const rl = { on: () => rl, once: () => rl, off: () => rl, removeListener: () => rl, removeAllListeners: () => rl, emit: () => false, close: () => {}, question: (q, cb) => { if (typeof cb === "function") cb(""); }, prompt: () => {}, write: () => {}, pause: () => rl, resume: () => rl, setPrompt: () => {}, [Symbol.asyncIterator]: async function* () {} }; return rl; },

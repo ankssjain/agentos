@@ -1753,6 +1753,7 @@ where
             env: operation.env.into_iter().collect(),
             cwd: operation.cwd,
             wasm_permission_tier: None,
+            retain_output: false,
         };
         let launch_result = if reused_resident {
             let language = operation

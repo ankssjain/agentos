@@ -1,8 +1,0 @@
-{
-  "name": "rivetkit-fixture-pass",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "rivetkit": "0.0.0-sqlite-uds.4e59a38"
-  }
-}

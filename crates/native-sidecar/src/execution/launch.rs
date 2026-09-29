@@ -668,6 +668,13 @@ pub(super) fn apply_shell_cwd_prefix(
     }
 
     let command_text = args[1].clone();
+    // `sh -c ""` is a valid no-op. Keep the cwd prefix syntactically complete
+    // without changing positional arguments (including an empty $0).
+    let command_text = if command_text.is_empty() {
+        ":"
+    } else {
+        &command_text
+    };
     let quoted_cwd = shell_single_quote(guest_cwd);
     args[1] = format!("cd {quoted_cwd} && {command_text}");
     args
@@ -676,6 +683,32 @@ pub(super) fn apply_shell_cwd_prefix(
 #[cfg(test)]
 mod shell_argument_tests {
     use super::apply_shell_cwd_prefix;
+
+    #[test]
+    fn preserves_empty_shell_script_and_positional_arguments() {
+        for command in ["sh", "bash"] {
+            for flag in ["-c", "-lc"] {
+                let args = vec![
+                    flag.into(),
+                    String::new(),
+                    String::new(),
+                    "tail".into(),
+                    String::new(),
+                ];
+                assert_eq!(apply_shell_cwd_prefix(command, args.clone(), "/"), args);
+                assert_eq!(
+                    apply_shell_cwd_prefix(command, args, "/work"),
+                    vec![
+                        flag.into(),
+                        "cd '/work' && :".into(),
+                        String::new(),
+                        "tail".into(),
+                        String::new()
+                    ],
+                );
+            }
+        }
+    }
 
     #[test]
     fn normalizes_bash_login_flag_after_command_option() {
@@ -1522,10 +1555,7 @@ fn should_skip_shadow_sync_path(vm: &VmState, guest_path: &str) -> bool {
         // guest path. Shadow files are stale compatibility artifacts there;
         // syncing them would overwrite memory/plugin state (or fail on a
         // read-only mount) and deleting them must not unmount guest data.
-        || vm.configuration.mounts.iter().any(|mount| {
-            normalize_path(&mount.guest_path) != "/"
-                && guest_path_is_at_or_below(guest_path, &mount.guest_path)
-        })
+        || crate::filesystem::is_non_root_mount_path(&vm.kernel, guest_path)
 }
 
 fn guest_path_is_at_or_below(path: &str, prefix: &str) -> bool {
@@ -2992,9 +3022,7 @@ pub(super) fn guest_runtime_identity(
             .js_runtime
             .as_ref()
             .is_some_and(|cfg| cfg.high_resolution_time.unwrap_or(false)),
-        // Userland bundle to bake into the per-sidecar snapshot. The sidecar
-        // derives this from configured agent packages with `agent.snapshot`.
-        snapshot_userland_code: vm.configuration.snapshot_userland_code.clone(),
+        snapshot_userland_code: None,
     }
 }
 
@@ -3293,7 +3321,7 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
 /// `host_dir`/`module_access` mounts (and the derived `/root/node_modules` root
 /// for nested mounts). When present, the V8 bridge thread resolves modules
 /// inline against this reader — concurrently with the service loop — so a large
-/// cold-start module graph never serializes behind / starves an in-flight ACP
+/// cold-start module graph never serializes behind / starves an in-flight extension
 /// `session/new` bootstrap on the single service-loop thread. The reader reads
 /// the same mounted tree the guest sees (anchored resolve-beneath, escaping-symlink
 /// refusal), never the host-direct path translator. Returns `None` when the VM
@@ -4818,6 +4846,12 @@ where
     let execution_engines = input.vm.try_read("clone VM execution services", |vm| {
         vm.execution_engines.clone()
     })?;
+    // Declare before the VM borrow so it is released after that borrow on all
+    // return/cancellation paths. The reservation remains counted across awaits.
+    let _replay_admission = payload
+        .retain_output
+        .then(|| input.vm.reserve_process_output_replay(&payload.process_id))
+        .transpose()?;
     let mut vm = input.vm.try_borrow_mut("prepare and start execution")?;
     if vm.active_processes.contains_key(&payload.process_id) {
         return Err(SidecarError::InvalidState(format!(

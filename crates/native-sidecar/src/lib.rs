@@ -19,6 +19,7 @@ pub(crate) mod metadata;
 pub(crate) mod ownership_coordinator;
 pub mod package_projection;
 pub(crate) mod plugins;
+pub mod process_entrypoint;
 pub(crate) mod process_event_broker;
 pub(crate) mod request_operations;
 pub mod service;

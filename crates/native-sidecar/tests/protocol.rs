@@ -105,6 +105,8 @@ fn ext_envelope_event_encoding_microbench() {
         process_id: String::from("proc-1"),
         channel: StreamChannel::Stdout,
         chunk: vec![b'x'; 256],
+        sequence: None,
+        timestamp_ms: None,
     };
     let direct_frame = ProtocolFrame::Event(EventFrame::new(
         ownership.clone(),
@@ -130,7 +132,7 @@ fn ext_envelope_event_encoding_microbench() {
         let ext_frame = ProtocolFrame::Event(EventFrame::new(
             ownership.clone(),
             EventPayload::Ext(ExtEnvelope {
-                namespace: String::from("dev.rivet.agentos.acp"),
+                namespace: String::from("dev.rivet.agentos.test"),
                 payload: inner,
             }),
         ));

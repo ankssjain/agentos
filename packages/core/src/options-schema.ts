@@ -1,8 +1,6 @@
 import { z } from "zod/v4";
 import type {
-	AgentExitHandler,
 	AgentOsOptions,
-	AgentStderrHandler,
 	LimitWarningHandler,
 	NativeMountConfig,
 } from "./agent-os.js";
@@ -114,6 +112,10 @@ export const permissionsSchema = z
 
 export const agentOsLimitsSchema = z
 	.object({
+		agentosPackages: z
+			.object({ maxMounts: positiveInteger.optional() })
+			.strict()
+			.optional(),
 		resources: z
 			.object({
 				cpuCount: positiveInteger.optional(),
@@ -164,29 +166,6 @@ export const agentOsLimitsSchema = z
 			.object({
 				maxPersistedManifestBytes: positiveInteger.optional(),
 				maxPersistedManifestFileBytes: nonNegativeInteger.optional(),
-			})
-			.strict()
-			.optional(),
-		acp: z
-			.object({
-				maxReadLineBytes: positiveInteger.optional(),
-				stdoutBufferByteLimit: positiveInteger.optional(),
-				maxCompletedMessageBytes: positiveInteger.optional(),
-				maxTurnOutputBytes: positiveInteger.optional(),
-				maxPromptBytes: positiveInteger.optional(),
-				maxPromptBlocks: positiveInteger.optional(),
-				maxFallbackContinuationBytes: positiveInteger.optional(),
-				maxSessionHistoryBytes: positiveInteger.optional(),
-				maxSessionHistoryEvents: positiveInteger.optional(),
-				maxHistoryPageEntries: positiveInteger.optional(),
-				maxSessionListEntries: positiveInteger.optional(),
-				maxSessionsPerVm: positiveInteger.optional(),
-				maxPromptsPerSession: positiveInteger.optional(),
-				maxPromptsPerVm: positiveInteger.optional(),
-				maxPendingPermissionsPerSession: positiveInteger.optional(),
-				maxPendingPermissionsPerVm: positiveInteger.optional(),
-				maxPermissionOutcomesPerSession: positiveInteger.optional(),
-				maxPermissionOutcomesPerVm: positiveInteger.optional(),
 			})
 			.strict()
 			.optional(),
@@ -397,26 +376,18 @@ export const hostFunctionsSchema = z.record(
  */
 export const agentOsOptionFieldSchemas = {
 	user: vmUserConfigSchema.optional(),
+	environment: z.record(z.string(), z.string()).optional(),
 	software: z.array(z.unknown()).optional(),
 	defaultSoftware: z.boolean().optional(),
 	loopbackExemptPorts: z.array(z.number().int().min(0).max(65535)).optional(),
 	allowedNodeBuiltins: stringArray.optional(),
 	highResolutionTime: z.boolean().optional(),
 	database: z
-		.discriminatedUnion("type", [
-			z
-				.object({
-					type: z.literal("actor_uds"),
-					path: z.string().min(1),
-				})
-				.strict(),
-			z
-				.object({
-					type: z.literal("sqlite_file"),
-					path: z.string().min(1),
-				})
-				.strict(),
-		])
+		.object({
+			type: z.literal("sqlite_file"),
+			path: z.string().min(1),
+		})
+		.strict()
 		.optional(),
 	rootFilesystem: rootFilesystemConfigSchema.optional(),
 	mounts: z.array(mountConfigSchema).optional(),
@@ -437,16 +408,6 @@ export const agentOsOptionFieldSchemas = {
 	permissions: permissionsSchema.optional(),
 	sidecar: sidecarConfigSchema.optional(),
 	limits: agentOsLimitsSchema.optional(),
-	onAgentStderr: z
-		.custom<AgentStderrHandler>((value) => typeof value === "function", {
-			message: "Expected function",
-		})
-		.optional(),
-	onAgentExit: z
-		.custom<AgentExitHandler>((value) => typeof value === "function", {
-			message: "Expected function",
-		})
-		.optional(),
 	onLimitWarning: z
 		.custom<LimitWarningHandler>((value) => typeof value === "function", {
 			message: "Expected function",

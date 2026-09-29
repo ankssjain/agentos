@@ -1,9 +1,6 @@
 pub trait NativeSidecarBridge: agentos_bridge::HostBridge {}
 impl<T> NativeSidecarBridge for T where T: agentos_bridge::HostBridge {}
 
-#[allow(dead_code, unused_imports)]
-#[path = "acp_legacy/mod.rs"]
-mod acp;
 #[allow(dead_code)]
 #[path = "../src/bootstrap.rs"]
 mod bootstrap;
@@ -2413,6 +2410,7 @@ ykAheWCsAteSEWVc0w==\n\
                         env: env.into_iter().collect(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch guest command");
@@ -11647,6 +11645,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch python execute");
@@ -11760,6 +11759,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch wasm command execute");
@@ -11862,6 +11862,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch wasm command execute");
@@ -11924,6 +11925,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                             env: std::collections::HashMap::new(),
                             cwd: None,
                             wasm_permission_tier: None,
+                            retain_output: false,
                         }),
                     ))
                     .expect("dispatch wasm execute");
@@ -12006,6 +12008,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                         env: std::collections::HashMap::new(),
                         cwd: Some(String::from("/")),
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch wasm execute");
@@ -12061,6 +12064,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
                         env: std::collections::HashMap::new(),
                         cwd: Some(String::from("/")),
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch wasm execute");
@@ -14927,6 +14931,7 @@ process.stdout.write(`${JSON.stringify({
                         env: std::collections::HashMap::new(),
                         cwd: Some(String::from("/workspace")),
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch javascript command execute");
@@ -14957,7 +14962,7 @@ process.stdout.write(`${JSON.stringify({
 
             write_fixture(
                 &package.join("agentos-package.json"),
-                r#"{"name":"t1-agent","version":"1.0.0","agent":{"acpEntrypoint":"x"}}"#,
+                r#"{"name":"t1-package","version":"1.0.0"}"#,
             );
             fs::create_dir_all(package.join("bin")).expect("create bin");
             std::os::unix::fs::symlink("../adapter.mjs", package.join("bin/x"))
@@ -15163,6 +15168,7 @@ if (child.status !== 0) {
                         env: std::collections::HashMap::new(),
                         cwd: Some(String::from("/")),
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch agentos package execute");
@@ -15236,6 +15242,7 @@ if (child.status !== 0) {
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                    retain_output: false,
                     }),
                 ))
                 .expect("dispatch node eval execute");
@@ -15278,6 +15285,7 @@ if (child.status !== 0) {
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch missing command execute");
@@ -17266,6 +17274,7 @@ console.log(seen.join("\n"));
                         env: std::collections::HashMap::new(),
                         cwd: None,
                         wasm_permission_tier: None,
+                        retain_output: false,
                     }),
                 ))
                 .expect("dispatch import fresh execute");

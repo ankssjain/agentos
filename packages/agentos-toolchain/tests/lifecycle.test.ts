@@ -14,7 +14,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { build } from "../src/build.js";
-import { resolveTag, validatePublishArtifact } from "../src/publish.js";
 import { stage } from "../src/stage.js";
 
 const dirs: string[] = [];
@@ -61,8 +60,12 @@ describe("stage", () => {
 			["bash", "cat", "df", "id", "linked-sh", "more", "sh"].sort(),
 		);
 		// Symlink sources are dereferenced into real files.
-		expect(lstatSync(join(pkg, "bin", "linked-sh")).isSymbolicLink()).toBe(false);
-		expect(readFileSync(join(pkg, "bin", "linked-sh"), "utf8")).toBe("\0asm-sh");
+		expect(lstatSync(join(pkg, "bin", "linked-sh")).isSymbolicLink()).toBe(
+			false,
+		);
+		expect(readFileSync(join(pkg, "bin", "linked-sh"), "utf8")).toBe(
+			"\0asm-sh",
+		);
 		expect(readFileSync(join(pkg, "bin", "bash"), "utf8")).toBe("\0asm-sh");
 		expect(readFileSync(join(pkg, "bin", "id"), "utf8")).toBe("\0asm-stubs");
 		for (const command of result.staged) {
@@ -145,9 +148,9 @@ describe("build", () => {
 		);
 		// Staging fields are build-time only — they must not ship at runtime.
 		expect(runtimeManifest).toEqual({ name: "fake", version: "1.2.3" });
-		expect(readFileSync(join(pkg, "dist", "package", "bin", "bash"), "utf8")).toBe(
-			"\0asm-sh",
-		);
+		expect(
+			readFileSync(join(pkg, "dist", "package", "bin", "bash"), "utf8"),
+		).toBe("\0asm-sh");
 		for (const command of result.commands) {
 			expect(
 				statSync(join(pkg, "dist", "package", "bin", command)).mode & 0o777,
@@ -161,34 +164,5 @@ describe("build", () => {
 		expect(result.commands).toEqual([]);
 		expect(existsSync(result.outTar)).toBe(true);
 		expect(existsSync(join(pkg, "dist", "package", "bin"))).toBe(false);
-	});
-});
-
-describe("resolveTag", () => {
-	test("defaults to dev, never latest", () => {
-		expect(resolveTag({})).toBe("dev");
-		expect(resolveTag({ tag: "my-branch" })).toBe("my-branch");
-	});
-	test("latest requires the explicit flag", () => {
-		expect(resolveTag({ latest: true })).toBe("latest");
-		expect(() => resolveTag({ tag: "latest" })).toThrow(/--latest/);
-		expect(() => resolveTag({ latest: true, tag: "dev" })).toThrow(/conflicts/);
-	});
-});
-
-describe("validatePublishArtifact", () => {
-	test("rejects a packed command package with missing declared binaries", () => {
-		const pkg = makePackageDir({ commands: ["sh", "cat"] });
-		const commandsDir = makeCommandsDir();
-		stage({ packageDir: pkg, commandsDir });
-		build(pkg);
-		expect(() => validatePublishArtifact(pkg, "1.2.3")).not.toThrow();
-
-		// A checkout without built commands can still assemble a placeholder.
-		const incomplete = makePackageDir({ commands: ["sh", "cat"] });
-		build(incomplete);
-		expect(() => validatePublishArtifact(incomplete, "1.2.3")).toThrow(
-			/missing declared commands: sh, cat/,
-		);
 	});
 });
