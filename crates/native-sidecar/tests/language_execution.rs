@@ -1387,7 +1387,7 @@ fn background_lifecycle_replays_cancels_resets_and_deletes() {
         ))
         .expect("start cancellable execution");
     assert_eq!(accepted_execution_id(cancellable), execution_id);
-    sidecar
+    let cancelled = sidecar
         .dispatch_wire_blocking(wire_request(
             7,
             wire_vm(&connection_id, &session_id, &vm_id),
@@ -1396,6 +1396,12 @@ fn background_lifecycle_replays_cancels_resets_and_deletes() {
             }),
         ))
         .expect("cancel execution");
+    match cancelled.response.payload {
+        wire::ResponsePayload::ExecutionDescriptorResponse(response) => {
+            assert_eq!(response.execution.execution_id, execution_id);
+        }
+        other => panic!("expected cancel to return the execution descriptor, got {other:?}"),
+    }
     assert_eq!(
         wait_for_execution(
             &mut sidecar,
