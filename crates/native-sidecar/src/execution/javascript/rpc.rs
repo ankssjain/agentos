@@ -4941,6 +4941,7 @@ pub(crate) fn error_code(error: &SidecarError) -> &'static str {
         SidecarError::RequestAdmission { code, .. } => code,
         SidecarError::VmTeardownDeadline { .. } => "timeout",
         SidecarError::InvalidState(_) => "invalid_state",
+        SidecarError::NotFound(_) => "ENOENT",
         SidecarError::ProtocolVersionMismatch(_) => "protocol_version_mismatch",
         SidecarError::BridgeVersionMismatch(_) => "bridge_version_mismatch",
         SidecarError::Conflict(_) => "conflict",

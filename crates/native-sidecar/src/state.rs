@@ -769,6 +769,8 @@ pub enum SidecarError {
         deadline_ms: u64,
     },
     InvalidState(String),
+    /// A requested resource does not exist. Reported to clients as `ENOENT`.
+    NotFound(String),
     ProtocolVersionMismatch(String),
     BridgeVersionMismatch(String),
     Conflict(String),
@@ -793,6 +795,7 @@ impl fmt::Display for SidecarError {
             Self::RequestAdmission { message, .. }
             | Self::VmTeardownDeadline { message, .. } => f.write_str(message),
             Self::InvalidState(message)
+            | Self::NotFound(message)
             | Self::ProtocolVersionMismatch(message)
             | Self::BridgeVersionMismatch(message)
             | Self::Conflict(message)

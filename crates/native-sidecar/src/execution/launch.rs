@@ -325,7 +325,7 @@ fn resolve_command_execution(
         env.get("PATH").map(String::as_str),
     )
     .ok_or_else(|| {
-        SidecarError::InvalidState(format!(
+        SidecarError::NotFound(format!(
             "command not found on native sidecar path: {command}"
         ))
     })?;

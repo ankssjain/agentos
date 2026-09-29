@@ -541,15 +541,15 @@ fn execute_rejects_host_only_absolute_command_path() {
             assert!(
                 rejected.code == "kernel_error"
                     || rejected.code == "execution_error"
-                    || rejected.code == "invalid_state",
+                    || rejected.code == "ENOENT",
                 "unexpected rejection code: {rejected:?}"
             );
-            if rejected.code == "invalid_state" {
+            if rejected.code == "ENOENT" {
                 assert!(
                     rejected
                         .message
                         .contains("command not found on native sidecar path"),
-                    "unexpected invalid_state rejection: {rejected:?}"
+                    "unexpected ENOENT rejection: {rejected:?}"
                 );
             }
             assert!(

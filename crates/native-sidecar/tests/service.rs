@@ -15292,7 +15292,7 @@ if (child.status !== 0) {
 
             match response.response.payload {
                 ResponsePayload::Rejected(rejected) => {
-                    assert_eq!(rejected.code, "invalid_state");
+                    assert_eq!(rejected.code, "ENOENT");
                     assert!(
                         rejected
                             .message

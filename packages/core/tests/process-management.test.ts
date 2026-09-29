@@ -50,6 +50,13 @@ describe("process management", () => {
 		await expect(vm.process.get(99999)).rejects.toThrow("Process not found");
 	});
 
+	test("spawning a command that does not exist fails with ENOENT", async () => {
+		const spawned = vm.process
+			.spawn("agentos-missing-command", [])
+			.then((process) => vm.process.wait(process.pid));
+		await expect(spawned).rejects.toThrow(/ENOENT/);
+	}, 30_000);
+
 	test("process.signal(pid, SIGTERM) terminates the process gracefully", async () => {
 		await vm.writeFile("/tmp/stop-me.mjs", "setTimeout(() => {}, 30000);");
 		const { pid } = await vm.process.spawn("node", ["/tmp/stop-me.mjs"], {
