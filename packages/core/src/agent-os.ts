@@ -5658,6 +5658,8 @@ export class AgentOs {
 		const shellExitPromises = [...this._pendingShellExitPromises];
 		this._shells.clear();
 		this._processes.clear();
+		this._languageProcesses.clear();
+		this._languageProcessIds.clear();
 		this._executionOutputHandlers.clear();
 		this._executionCompletedHandlers.clear();
 		await waitForTrackedExitPromises(
