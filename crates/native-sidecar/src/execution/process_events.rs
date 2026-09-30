@@ -1273,7 +1273,7 @@ where
         Ok(())
     }
 
-    fn internal_execution_event(event: &ActiveExecutionEvent) -> bool {
+    pub(super) fn internal_execution_event(event: &ActiveExecutionEvent) -> bool {
         matches!(
             event,
             ActiveExecutionEvent::JavascriptSyncRpcRequest(_)

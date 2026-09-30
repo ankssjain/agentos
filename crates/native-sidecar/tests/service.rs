@@ -25587,7 +25587,21 @@ console.log(JSON.stringify({
 
         #[test]
         fn wasm_parent_services_queued_python_requests_without_consuming_child_output() {
+            assert_wasm_parent_python_service_progress(8);
+        }
+
+        #[test]
+        fn wasm_parent_python_services_rearm_after_coalesced_notification() {
+            assert_wasm_parent_python_service_progress(1);
+        }
+
+        fn assert_wasm_parent_python_service_progress(child_quantum: usize) {
             let mut sidecar = create_test_sidecar();
+            sidecar
+                .config
+                .runtime
+                .fairness
+                .capability_quantum_operations = child_quantum;
             let (connection_id, session_id) =
                 authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
             let vm_id = create_vm(
@@ -25645,6 +25659,8 @@ console.log(JSON.stringify({
                 GuestRuntimeKind::Python,
                 ActiveExecution::Python(execution),
             );
+            let notify = Arc::clone(&sidecar.process_event_notify);
+            child = child.with_event_notify(Arc::clone(&notify));
             // The WASM parent's poller requeues these events for the supervisor.
             // Neither request may be stranded behind the WASM-parent guard.
             child
@@ -25710,23 +25726,32 @@ console.log(JSON.stringify({
                 .active_processes
                 .insert(String::from("wasm-root"), root);
 
-            let mut javascript_services = Vec::new();
             let mut python_services = Vec::new();
             let mut socket_completions = Vec::new();
-            let mut child_bridge_services = Vec::new();
-            // One claim per pump also checks that the second queued request
-            // makes progress on the next supervisor turn.
-            for _ in 0..2 {
-                sidecar
-                    .pump_child_process_events_nowait(
-                        &vm_id,
-                        &mut javascript_services,
-                        &mut python_services,
-                        &mut socket_completions,
-                        &mut child_bridge_services,
-                        2,
-                    )
+            let ownership = OwnershipScope::vm(&connection_id, &session_id, &vm_id);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // All producer notifications have coalesced. Each subsequent turn
+            // must be justified by a continuation, not a manual second call.
+            let turns = if child_quantum == 1 { 2 } else { 1 };
+            for _ in 0..turns {
+                assert!(
+                    std::future::Future::poll(Box::pin(notify.notified()).as_mut(), &mut cx)
+                        .is_ready(),
+                    "queued Python requests need a wake-up before each turn"
+                );
+                let turn = sidecar
+                    .pump_process_events_nowait(&ownership, 8)
                     .expect("pump Python child requests");
+                assert_eq!(
+                    turn.python_services.len() + turn.python_socket_completions.len(),
+                    if child_quantum == 1 { 1 } else { 2 },
+                    "claim queued services up to the fairness limit"
+                );
+                assert!(!turn.emitted_any, "internal claims are not public output");
+                assert!(turn.javascript_services.is_empty());
+                assert!(turn.child_bridge_services.is_empty());
+                python_services.extend(turn.python_services);
+                socket_completions.extend(turn.python_socket_completions);
             }
             assert_eq!(
                 python_services.len(),
@@ -25744,8 +25769,20 @@ console.log(JSON.stringify({
                 "supervisor must claim Python socket completion"
             );
             assert_eq!(socket_completions[0].completion.request_id, 2);
-            assert!(javascript_services.is_empty());
-            assert!(child_bridge_services.is_empty());
+            // Drain a possible final fairness continuation. Shell-owned output
+            // must neither be consumed nor cause the supervisor to hot-spin.
+            let _ = std::future::Future::poll(Box::pin(notify.notified()).as_mut(), &mut cx);
+            let empty = sidecar
+                .pump_process_events_nowait(&ownership, 8)
+                .expect("shell-output-only follow-up");
+            assert!(!empty.emitted_any);
+            assert!(empty.python_services.is_empty());
+            assert!(empty.python_socket_completions.is_empty());
+            assert!(
+                std::future::Future::poll(Box::pin(notify.notified()).as_mut(), &mut cx)
+                    .is_pending(),
+                "shell-owned output must not rearm the supervisor"
+            );
             assert!(sidecar.pending_process_events.is_empty());
             let vm = sidecar.vms.get(&vm_id).expect("test vm");
             let child = &vm.active_processes["wasm-root"].child_processes["python-child"];
