@@ -25587,15 +25587,24 @@ console.log(JSON.stringify({
 
         #[test]
         fn wasm_parent_services_queued_python_requests_without_consuming_child_output() {
-            assert_wasm_parent_python_service_progress(8);
+            assert_wasm_parent_python_service_progress(8, false);
         }
 
         #[test]
         fn wasm_parent_python_services_rearm_after_coalesced_notification() {
-            assert_wasm_parent_python_service_progress(1);
+            assert_wasm_parent_python_service_progress(1, false);
         }
 
-        fn assert_wasm_parent_python_service_progress(child_quantum: usize) {
+        #[test]
+        fn wasm_parent_mixed_javascript_python_services_make_progress() {
+            assert_wasm_parent_python_service_progress(8, true);
+            assert_wasm_parent_python_service_progress(1, true);
+        }
+
+        fn assert_wasm_parent_python_service_progress(
+            child_quantum: usize,
+            include_javascript: bool,
+        ) {
             let mut sidecar = create_test_sidecar();
             sidecar
                 .config
@@ -25661,6 +25670,26 @@ console.log(JSON.stringify({
             );
             let notify = Arc::clone(&sidecar.process_event_notify);
             child = child.with_event_notify(Arc::clone(&notify));
+            if include_javascript {
+                // This method has an inline handler in the compatibility poll
+                // path. The supervisor must instead claim it as an owned
+                // service, account for it, and continue to the Python request.
+                child
+                    .queue_pending_execution_event(ActiveExecutionEvent::JavascriptSyncRpcRequest(
+                        JavascriptSyncRpcRequest {
+                            id: 3,
+                            method: String::from("process.signal_state"),
+                            args: vec![
+                                Value::from(libc::SIGTERM),
+                                Value::from("ignore"),
+                                Value::from("[]"),
+                                Value::from(0),
+                            ],
+                            raw_bytes_args: Default::default(),
+                        },
+                    ))
+                    .expect("queue JavaScript request before Python requests");
+            }
             // The WASM parent's poller requeues these events for the supervisor.
             // Neither request may be stranded behind the WASM-parent guard.
             child
@@ -25726,13 +25755,19 @@ console.log(JSON.stringify({
                 .active_processes
                 .insert(String::from("wasm-root"), root);
 
+            let mut javascript_services = Vec::new();
             let mut python_services = Vec::new();
             let mut socket_completions = Vec::new();
             let ownership = OwnershipScope::vm(&connection_id, &session_id, &vm_id);
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             // All producer notifications have coalesced. Each subsequent turn
             // must be justified by a continuation, not a manual second call.
-            let turns = if child_quantum == 1 { 2 } else { 1 };
+            let total_services = 2 + usize::from(include_javascript);
+            let turns = if child_quantum == 1 {
+                total_services
+            } else {
+                1
+            };
             for _ in 0..turns {
                 assert!(
                     std::future::Future::poll(Box::pin(notify.notified()).as_mut(), &mut cx)
@@ -25743,15 +25778,30 @@ console.log(JSON.stringify({
                     .pump_process_events_nowait(&ownership, 8)
                     .expect("pump Python child requests");
                 assert_eq!(
-                    turn.python_services.len() + turn.python_socket_completions.len(),
-                    if child_quantum == 1 { 1 } else { 2 },
+                    turn.javascript_services.len()
+                        + turn.python_services.len()
+                        + turn.python_socket_completions.len(),
+                    if child_quantum == 1 {
+                        1
+                    } else {
+                        total_services
+                    },
                     "claim queued services up to the fairness limit"
                 );
                 assert!(!turn.emitted_any, "internal claims are not public output");
-                assert!(turn.javascript_services.is_empty());
                 assert!(turn.child_bridge_services.is_empty());
+                javascript_services.extend(turn.javascript_services);
                 python_services.extend(turn.python_services);
                 socket_completions.extend(turn.python_socket_completions);
+            }
+            assert_eq!(javascript_services.len(), usize::from(include_javascript));
+            if include_javascript {
+                assert_eq!(javascript_services[0].request.id, 3);
+                assert_eq!(
+                    javascript_services[0].request.method,
+                    "process.signal_state"
+                );
+                assert_eq!(javascript_services[0].child_path, ["python-child"]);
             }
             assert_eq!(
                 python_services.len(),
@@ -25776,6 +25826,7 @@ console.log(JSON.stringify({
                 .pump_process_events_nowait(&ownership, 8)
                 .expect("shell-output-only follow-up");
             assert!(!empty.emitted_any);
+            assert!(empty.javascript_services.is_empty());
             assert!(empty.python_services.is_empty());
             assert!(empty.python_socket_completions.is_empty());
             assert!(
