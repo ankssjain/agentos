@@ -1,24 +1,22 @@
-import common from "@agentos-software/common";
+import coreutils from "@agentos-software/coreutils";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { z } from "zod";
-import { AgentOs, hostFunction, hostFunctions } from "../src/index.js";
+import { AgentOs } from "../src/index.js";
 
 // Regression coverage for rivet-dev/agentos#1885: the `agentos-<collection>`
 // command stub must dispatch to the host function when it is executed the way
 // agents run it, through the shell and a PATH lookup, not only via a direct
 // `spawn`.
 
-const weatherFunctions = hostFunctions({
-	name: "weather",
-	description: "Weather data functions",
-	functions: {
-		forecast: hostFunction({
-			description: "Get a forecast",
-			inputSchema: z.object({ city: z.string() }).strict(),
-			execute: ({ city }) => ({ city, temperature: 22 }),
-		}),
+const weatherFunctions = {
+	forecast: {
+		inputSchema: z
+			.object({ city: z.string() })
+			.strict()
+			.describe("Get a forecast"),
+		execute: ({ city }) => ({ city, temperature: 22 }),
 	},
-});
+};
 
 const EXPECTED_ENVELOPE = {
 	ok: true,
@@ -53,6 +51,8 @@ describe.each([
 	{
 		label: "without extra software",
 		options: {
+			defaultSoftware: false,
+			software: [coreutils],
 			permissions: {
 				fs: "allow",
 				childProcess: "allow",
@@ -64,8 +64,8 @@ describe.each([
 		},
 	},
 	{
-		label: "with the common software package",
-		options: { software: [common] },
+		label: "with the coreutils software package",
+		options: { defaultSoftware: false, software: [coreutils] },
 	},
 ] as const)("hostFunction command exec ($label)", ({ options }) => {
 	let vm: AgentOs;
@@ -73,7 +73,7 @@ describe.each([
 	beforeAll(async () => {
 		vm = await AgentOs.create({
 			...options,
-			hostFunctions: [weatherFunctions],
+			hostFunctions: { weather: weatherFunctions },
 		} as Parameters<typeof AgentOs.create>[0]);
 	}, 60_000);
 
@@ -105,13 +105,7 @@ describe.each([
 		expect(JSON.parse(result.stdout)).toEqual({
 			ok: true,
 			result: {
-				hostFunctions: [
-					{
-						name: "weather",
-						description: "Weather data functions",
-						functions: ["forecast"],
-					},
-				],
+				hostFunctions: [{ name: "weather", functions: ["forecast"] }],
 			},
 		});
 	});

@@ -289,9 +289,9 @@ impl Drop for ChildBridgeRelayLease {
 struct ClaimedDescendantBridgeEvent {
     event: Value,
     reservation: Option<PendingExecutionEventReservation>,
-    // Claiming an owned service is progress even when there is no event to
-    // deliver to the parent. Both attached and detached pumps must budget it.
-    service_claims: usize,
+    // Includes both staged services and completions settled in place. Neither
+    // needs a parent-facing event, but both consume the caller's work budget.
+    internal_work: usize,
 }
 
 impl OwnedChildBridgeEventService {
@@ -2637,6 +2637,22 @@ pub(super) fn apply_child_process_argv0(
     }
 }
 
+fn javascript_rpc_requires_owned_supervisor(method: &str) -> bool {
+    matches!(
+        method,
+        "child_process.spawn"
+            | "child_process.spawn_sync"
+            | "child_process.poll"
+            | "child_process.write_stdin"
+            | "child_process.close_stdin"
+            | "child_process.kill"
+            | "process.exec_fd_image_commit"
+            | "process.exec"
+            | "process.signal_state"
+            | "process.kill"
+    )
+}
+
 impl<B> NativeSidecar<B>
 where
     B: NativeSidecarBridge + Send + 'static,
@@ -2759,33 +2775,44 @@ where
 
                 // The standalone WASM runner pulls descendant output through
                 // child_process.poll while implementing waitpid. Keep stream
-                // and exit delivery single-owner; the parked kernel wait was
-                // already rechecked above without leasing either event lane.
-                let parent_is_pull_driven_wasm = self
+                // and exit delivery single-owner. JavaScript process-control
+                // RPCs and Python bridge work still need the supervisor;
+                // ordinary JavaScript RPCs remain owned by the pull lane.
+                let (parent_is_pull_driven_wasm, needs_supervisor) = self
                     .vms
                     .get(vm_id)
                     .map(|vm| {
-                        vm.active_processes
+                        let parent = vm
+                            .active_processes
                             .get(process_id)
-                            .and_then(|root| Self::active_process_by_path(root, &parent_path))
-                            .is_some_and(|parent| parent.runtime == GuestRuntimeKind::WebAssembly)
+                            .and_then(|root| Self::active_process_by_path(root, &parent_path));
+                        let child =
+                            parent.and_then(|parent| parent.child_processes.get(&child_process_id));
+                        (
+                            parent.is_some_and(|parent| {
+                                parent.runtime == GuestRuntimeKind::WebAssembly
+                            }),
+                            child.is_some_and(|child| {
+                                match child.pending_execution_events.front() {
+                                    Some(ActiveExecutionEvent::JavascriptSyncRpcRequest(
+                                        request,
+                                    )) => javascript_rpc_requires_owned_supervisor(&request.method),
+                                    Some(
+                                        ActiveExecutionEvent::JavascriptSyncRpcCompletion(_)
+                                        | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                                        | ActiveExecutionEvent::PythonSocketConnectCompletion(_),
+                                    ) => true,
+                                    Some(_) => false,
+                                    // JavaScript can expose a request directly from
+                                    // its runtime before the parent has polled it.
+                                    None => child.runtime == GuestRuntimeKind::JavaScript,
+                                }
+                            }),
+                        )
                     })
-                    .unwrap_or(false);
-                if parent_is_pull_driven_wasm {
-                    // The parent's poller leaves internal requests and
-                    // completions for the supervisor, regardless of language.
-                    // Stream and exit events remain owned by the parent.
-                    let queued_internal_event = self.vms.get(vm_id).is_some_and(|vm| {
-                        vm.active_processes
-                            .get(process_id)
-                            .and_then(|root| Self::active_process_by_path(root, &parent_path))
-                            .and_then(|parent| parent.child_processes.get(&child_process_id))
-                            .and_then(|child| child.pending_execution_events.front())
-                            .is_some_and(Self::internal_execution_event)
-                    });
-                    if !queued_internal_event {
-                        continue;
-                    }
+                    .unwrap_or((false, false));
+                if parent_is_pull_driven_wasm && !needs_supervisor {
+                    continue;
                 }
                 self.expire_child_process_sync_if_needed(
                     vm_id,
@@ -2812,12 +2839,13 @@ where
                 let ClaimedDescendantBridgeEvent {
                     event,
                     reservation,
-                    service_claims,
+                    internal_work,
                 } = claimed;
-                if service_claims > 0 {
+                if internal_work > 0 {
+                    emitted_any = true;
                     progressed_this_round = true;
-                    work += service_claims;
-                    child_work[candidate_index] += service_claims;
+                    work += internal_work;
+                    child_work[candidate_index] += internal_work;
                 }
                 if event.is_null() {
                     continue;
@@ -3616,14 +3644,14 @@ where
                 let ClaimedDescendantBridgeEvent {
                     event,
                     reservation,
-                    service_claims,
+                    internal_work,
                 } = claimed;
-                work += service_claims;
-                detached_work += service_claims;
+                work += internal_work;
+                detached_work += internal_work;
 
                 let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-                    if service_claims > 0 {
-                        // Continue draining owned services, or rearm at the
+                    if internal_work > 0 {
+                        // Continue draining internal work, or rearm at the
                         // capacity/fairness checks at the top of the loop.
                         continue;
                     }
@@ -8040,6 +8068,7 @@ where
                     None,
                     None,
                     None,
+                    None,
                 ))
                 .await
                 .map(Into::into)
@@ -8551,9 +8580,7 @@ where
         owned_python_socket_completions: &mut Vec<OwnedPythonSocketCompletionService>,
         public_process_id: Option<&str>,
     ) -> Result<ClaimedDescendantBridgeEvent, SidecarError> {
-        let service_count_before = owned_javascript_services.len()
-            + owned_python_services.len()
-            + owned_python_socket_completions.len();
+        let mut internal_work = 0;
         let mut claimed_reservation = None;
         let mut future = Box::pin(self.poll_descendant_javascript_child_process(
             vm_id,
@@ -8562,24 +8589,21 @@ where
             child_process_id,
             0,
             preserve_pull_owned_events,
-            Some(&mut *owned_javascript_services),
-            Some(&mut *owned_python_services),
-            Some(&mut *owned_python_socket_completions),
+            Some(&mut internal_work),
+            Some(owned_javascript_services),
+            Some(owned_python_services),
+            Some(owned_python_socket_completions),
             Some(&mut claimed_reservation),
             public_process_id,
         ));
         let mut context = Context::from_waker(Waker::noop());
         let poll = future.as_mut().poll(&mut context);
         drop(future);
-        let service_claims = owned_javascript_services.len()
-            + owned_python_services.len()
-            + owned_python_socket_completions.len()
-            - service_count_before;
         match poll {
             Poll::Ready(result) => result.map(|event| ClaimedDescendantBridgeEvent {
                 event,
                 reservation: claimed_reservation,
-                service_claims,
+                internal_work,
             }),
             Poll::Pending => Err(SidecarError::InvalidState(String::from(
                 "ERR_AGENTOS_CHILD_EVENT_TURN_SUSPENDED: bounded child event claim unexpectedly suspended",
@@ -8598,6 +8622,7 @@ where
         child_process_id: &str,
         wait_ms: u64,
         preserve_pull_owned_events: bool,
+        mut claimed_internal_work: Option<&mut usize>,
         mut owned_javascript_services: Option<&mut Vec<OwnedJavascriptEventService>>,
         mut owned_python_services: Option<&mut Vec<OwnedPythonEventService>>,
         mut owned_python_socket_completions: Option<&mut Vec<OwnedPythonSocketCompletionService>>,
@@ -8613,6 +8638,15 @@ where
         let _ = wait_ms;
 
         loop {
+            // A supervised poll may consume one internal event before yielding
+            // to the caller's VM/child budget checks. In-place completions must
+            // not drain an unbounded queue behind a single counted service.
+            if claimed_internal_work
+                .as_deref()
+                .is_some_and(|work| *work > 0)
+            {
+                return Ok(Value::Null);
+            }
             self.drain_queued_descendant_javascript_child_process_events(
                 vm_id,
                 process_id,
@@ -8704,6 +8738,7 @@ where
                     ActiveExecutionEvent::Stdout(_)
                         | ActiveExecutionEvent::Stderr(_)
                         | ActiveExecutionEvent::Exited(_)
+                        | ActiveExecutionEvent::SignalState { .. }
                 )
             {
                 let Some(mut vm) = self.vms.get_mut(vm_id) else {
@@ -8717,10 +8752,8 @@ where
                 let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                     return Ok(Value::Null);
                 };
-                child.queue_pending_polled_execution_event(PolledExecutionEvent {
-                    event,
-                    reservation,
-                })?;
+                child
+                    .requeue_pending_execution_event(PolledExecutionEvent { event, reservation })?;
                 return Ok(Value::Null);
             }
             match event {
@@ -9060,6 +9093,31 @@ where
                 ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
                     let mut current_child_path = current_process_path.to_vec();
                     current_child_path.push(child_process_id);
+                    let requires_owned_supervisor =
+                        javascript_rpc_requires_owned_supervisor(&request.method);
+                    if preserve_pull_owned_events && !requires_owned_supervisor {
+                        let Some(mut vm) = self.vms.get_mut(vm_id) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(parent) = Self::descendant_parent_process_mut(
+                            &mut vm,
+                            process_id,
+                            current_process_path,
+                        ) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(child) = parent.child_processes.get_mut(child_process_id) else {
+                            return Ok(Value::Null);
+                        };
+                        child.requeue_pending_execution_event(PolledExecutionEvent {
+                            event: ActiveExecutionEvent::JavascriptSyncRpcRequest(request),
+                            reservation,
+                        })?;
+                        return Ok(Value::Null);
+                    }
+                    if let Some(work) = claimed_internal_work.as_deref_mut() {
+                        *work += 1;
+                    }
                     if let Some(services) = owned_javascript_services.as_deref_mut() {
                         let Some((connection_id, session_id, vm)) =
                             self.vms.get(vm_id).and_then(|state| {
@@ -9458,6 +9516,9 @@ where
                     }
                 }
                 ActiveExecutionEvent::PythonVfsRpcRequest(request) => {
+                    if let Some(work) = claimed_internal_work.as_deref_mut() {
+                        *work += 1;
+                    }
                     let Some(services) = owned_python_services.as_deref_mut() else {
                         return Err(SidecarError::InvalidState(String::from(
                             "ERR_AGENTOS_PYTHON_EVENT_OWNERSHIP: nested Python VFS RPC must be claimed by the owned process-event supervisor",
@@ -9506,6 +9567,9 @@ where
                     return Ok(Value::Null);
                 }
                 ActiveExecutionEvent::PythonSocketConnectCompletion(completion) => {
+                    if let Some(work) = claimed_internal_work.as_deref_mut() {
+                        *work += 1;
+                    }
                     let Some(services) = owned_python_socket_completions.as_deref_mut() else {
                         return Err(SidecarError::InvalidState(String::from(
                             "ERR_AGENTOS_PYTHON_SOCKET_COMPLETION_OWNERSHIP: nested completion must be claimed by the owned process-event supervisor",
@@ -9554,6 +9618,9 @@ where
                     return Ok(Value::Null);
                 }
                 ActiveExecutionEvent::JavascriptSyncRpcCompletion(completion) => {
+                    if let Some(work) = claimed_internal_work.as_deref_mut() {
+                        *work += 1;
+                    }
                     drop(reservation);
                     let Some(mut vm) = self.vms.get_mut(vm_id) else {
                         return Ok(Value::Null);
@@ -10047,6 +10114,7 @@ where
             child_process_id,
             wait_ms,
             false,
+            None,
             None,
             None,
             None,
@@ -11051,6 +11119,151 @@ mod child_event_claim_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn wasm_parent_pull_lane_still_claims_child_internal_rpc() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut sidecar, vm_id) =
+                    sidecar_with_test_vm(agentos_runtime::DEFAULT_PROTOCOL_MAX_PROCESS_EVENTS)
+                        .await;
+                let root_id = String::from("wasm-pull-root");
+                let child_id = String::from("javascript-child");
+                {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("WASM pull VM");
+                    let mut root = host_function_process(&mut vm, "WASM pull root", None);
+                    root.runtime = GuestRuntimeKind::WebAssembly;
+                    let mut child =
+                        host_function_process(&mut vm, "JavaScript child", Some(root.kernel_pid));
+                    child
+                        .queue_pending_execution_event(rpc(40))
+                        .expect("queue pull-owned child RPC");
+                    root.child_processes.insert(child_id.clone(), child);
+                    vm.active_processes.insert(root_id.clone(), root);
+                }
+
+                let mut javascript = Vec::new();
+                let mut python = Vec::new();
+                let mut python_socket_completions = Vec::new();
+                let mut child_bridge = Vec::new();
+                assert!(!sidecar
+                    .pump_child_process_events_nowait(
+                        &vm_id,
+                        &mut javascript,
+                        &mut python,
+                        &mut python_socket_completions,
+                        &mut child_bridge,
+                        8,
+                    )
+                    .expect("pump WASM-owned child lane"));
+                assert!(javascript.is_empty());
+                {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("WASM pull VM");
+                    let child = vm
+                        .active_processes
+                        .get_mut(&root_id)
+                        .and_then(|root| root.child_processes.get_mut(&child_id))
+                        .expect("JavaScript child");
+                    let ActiveExecutionEvent::JavascriptSyncRpcRequest(request) = child
+                        .pop_pending_execution_event()
+                        .expect("pull-owned RPC remains queued")
+                    else {
+                        panic!("expected queued JavaScript RPC");
+                    };
+                    assert_eq!(request.method, "fs.stat");
+                    child
+                        .queue_pending_execution_event(
+                            ActiveExecutionEvent::JavascriptSyncRpcRequest(
+                                JavascriptSyncRpcRequest {
+                                    id: 41,
+                                    method: String::from("child_process.spawn"),
+                                    args: Vec::new(),
+                                    raw_bytes_args: Default::default(),
+                                },
+                            ),
+                        )
+                        .expect("queue supervisor-owned child RPC");
+                }
+                assert!(sidecar
+                    .pump_child_process_events_nowait(
+                        &vm_id,
+                        &mut javascript,
+                        &mut python,
+                        &mut python_socket_completions,
+                        &mut child_bridge,
+                        8,
+                    )
+                    .expect("pump supervisor-owned child RPC"));
+                assert_eq!(javascript.len(), 1);
+                assert!(python.is_empty());
+                assert!(python_socket_completions.is_empty());
+                assert!(child_bridge.is_empty());
+                assert_eq!(javascript[0].request.method, "child_process.spawn");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wasm_parent_pull_lane_preserves_wasm_child_output_and_exit() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut sidecar, vm_id) =
+                    sidecar_with_test_vm(agentos_runtime::DEFAULT_PROTOCOL_MAX_PROCESS_EVENTS)
+                        .await;
+                let root_id = String::from("wasm-parent");
+                let child_id = String::from("wasm-child");
+                {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("WASM pull VM");
+                    let mut root = host_function_process(&mut vm, "WASM parent", None);
+                    root.runtime = GuestRuntimeKind::WebAssembly;
+                    let mut child =
+                        host_function_process(&mut vm, "WASM child", Some(root.kernel_pid));
+                    child.runtime = GuestRuntimeKind::WebAssembly;
+                    child
+                        .queue_pending_execution_event(ActiveExecutionEvent::Stdout(
+                            b"child-output".to_vec(),
+                        ))
+                        .expect("queue WASM child output");
+                    child
+                        .queue_pending_execution_event(ActiveExecutionEvent::Exited(0))
+                        .expect("queue WASM child exit");
+                    root.child_processes.insert(child_id.clone(), child);
+                    vm.active_processes.insert(root_id.clone(), root);
+                }
+
+                let mut javascript = Vec::new();
+                let mut python = Vec::new();
+                let mut python_socket_completions = Vec::new();
+                let mut child_bridge = Vec::new();
+                assert!(!sidecar
+                    .pump_child_process_events_nowait(
+                        &vm_id,
+                        &mut javascript,
+                        &mut python,
+                        &mut python_socket_completions,
+                        &mut child_bridge,
+                        8,
+                    )
+                    .expect("pump WASM-owned child lane"));
+                assert!(javascript.is_empty());
+                assert!(python.is_empty());
+                assert!(python_socket_completions.is_empty());
+                assert!(child_bridge.is_empty());
+
+                let vm = sidecar.vms.get(&vm_id).expect("WASM pull VM");
+                let child = vm
+                    .active_processes
+                    .get(&root_id)
+                    .and_then(|root| root.child_processes.get(&child_id))
+                    .expect("WASM child remains pull-owned");
+                assert!(matches!(
+                    child.pending_execution_events.as_slices().0,
+                    [ActiveExecutionEvent::Stdout(bytes), ActiveExecutionEvent::Exited(0)]
+                        if bytes == b"child-output"
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn attached_and_detached_claims_are_exactly_once_and_capacity_bounded() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -11166,6 +11379,116 @@ mod child_event_claim_tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_child_poll_preserves_pull_owned_events_without_counting_work() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut sidecar, vm_id) =
+                    sidecar_with_test_vm(agentos_runtime::DEFAULT_PROTOCOL_MAX_PROCESS_EVENTS)
+                        .await;
+                let notify = Arc::clone(&sidecar.process_event_notify);
+                let root_id = String::from("pull-owned-root");
+                let child_id = String::from("pull-owned-child");
+                {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("pull-owned VM");
+                    let mut root = host_function_process(&mut vm, "pull-owned parent", None);
+                    root.runtime = GuestRuntimeKind::WebAssembly;
+                    let mut child =
+                        host_function_process(&mut vm, "pull-owned child", Some(root.kernel_pid))
+                            .with_event_notify(Arc::clone(&notify));
+                    let (signal, registration) = parse_process_signal_state_request(
+                        &signal_state_rpc(1, libc::SIGTERM as u32, "ignore").args,
+                    )
+                    .expect("signal-state fixture");
+                    for event in [
+                        rpc(1),
+                        ActiveExecutionEvent::SignalState {
+                            signal,
+                            registration,
+                        },
+                        ActiveExecutionEvent::Stdout(b"stdout".to_vec()),
+                        ActiveExecutionEvent::Stderr(b"stderr".to_vec()),
+                        ActiveExecutionEvent::Exited(0),
+                    ] {
+                        child
+                            .queue_pending_execution_event(event)
+                            .expect("queue pull-owned event");
+                    }
+                    root.child_processes.insert(child_id.clone(), child);
+                    vm.active_processes.insert(root_id.clone(), root);
+                }
+                consume_notify_permit(&notify).await;
+                for remaining in (1..=5).rev() {
+                    let mut javascript = Vec::new();
+                    let claimed = sidecar
+                        .poll_descendant_javascript_child_process_nowait(
+                            &vm_id,
+                            &root_id,
+                            &[],
+                            &child_id,
+                            true,
+                            &mut javascript,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            None,
+                        )
+                        .expect("probe pull-owned event");
+                    assert!(claimed.event.is_null());
+                    assert_eq!(
+                        claimed.internal_work, 0,
+                        "requeued events are not consumed work"
+                    );
+                    assert!(javascript.is_empty());
+                    // Requeueing restores one producer notification. The normal
+                    // pump must skip this parent-owned queue on that wake and
+                    // quiesce, rather than repeatedly probe and requeue it.
+                    consume_notify_permit(&notify).await;
+                    let turn = sidecar
+                        .pump_process_events_nowait(
+                            &OwnershipScope::vm(
+                                "child-claim-connection",
+                                "child-claim-session",
+                                &vm_id,
+                            ),
+                            8,
+                        )
+                        .expect("parent-owned queue follow-up");
+                    assert!(!turn.emitted_any);
+                    assert!(turn.javascript_services.is_empty());
+                    assert!(turn.child_bridge_services.is_empty());
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(10), notify.notified())
+                            .await
+                            .is_err(),
+                        "parent-owned queues must not hot-rearm the supervisor"
+                    );
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("pull-owned VM");
+                    let child = vm
+                        .active_processes
+                        .get_mut(&root_id)
+                        .unwrap()
+                        .child_processes
+                        .get_mut(&child_id)
+                        .unwrap();
+                    assert_eq!(child.pending_execution_events.len(), remaining);
+                    // Simulate the parent consuming its next event. The
+                    // supervisor's probe must not rotate it behind later output.
+                    let event = child
+                        .pop_pending_execution_event()
+                        .expect("parent-owned event");
+                    assert!(match remaining {
+                        5 => matches!(event, ActiveExecutionEvent::JavascriptSyncRpcRequest(_)),
+                        4 => matches!(event, ActiveExecutionEvent::SignalState { .. }),
+                        3 => matches!(event, ActiveExecutionEvent::Stdout(_)),
+                        2 => matches!(event, ActiveExecutionEvent::Stderr(_)),
+                        1 => matches!(event, ActiveExecutionEvent::Exited(0)),
+                        _ => unreachable!(),
+                    });
+                }
+            })
+            .await;
+    }
+
     async fn assert_child_service_claims_make_bounded_progress(detached: bool) {
         // Test ordinary parents as well as pull-driven shells. Every producer
         // runs before the first turn, so further turns require pump rearming.
@@ -11196,7 +11519,13 @@ mod child_event_claim_tests {
                             .with_event_notify(Arc::clone(&notify));
                     for id in 1..=3 {
                         child
-                            .queue_pending_execution_event(rpc(id))
+                            .queue_pending_execution_event(
+                                ActiveExecutionEvent::JavascriptSyncRpcRequest(signal_state_rpc(
+                                    id,
+                                    libc::SIGTERM as u32,
+                                    "ignore",
+                                )),
+                            )
                             .expect("queue child service request");
                     }
                     if wasm_parent && !detached {
@@ -11318,6 +11647,171 @@ mod child_event_claim_tests {
     async fn detached_service_claims_make_bounded_progress_after_coalesced_notify() {
         tokio::task::LocalSet::new()
             .run_until(assert_child_service_claims_make_bounded_progress(true))
+            .await;
+    }
+
+    async fn assert_child_completions_make_bounded_progress(detached: bool) {
+        for wasm_parent in [false, true] {
+            for (vm_quantum, child_quantum, batch_size) in [(1, 8, 1), (8, 1, 1), (8, 8, 3)] {
+                let (mut sidecar, vm_id) =
+                    sidecar_with_test_vm(agentos_runtime::DEFAULT_PROTOCOL_MAX_PROCESS_EVENTS)
+                        .await;
+                sidecar.config.runtime.fairness.vm_quantum_operations = vm_quantum;
+                sidecar
+                    .config
+                    .runtime
+                    .fairness
+                    .capability_quantum_operations = child_quantum;
+                let notify = Arc::clone(&sidecar.process_event_notify);
+                let root_id = String::from("completion-root");
+                let child_id = String::from("completion-child");
+                let (mut root, mut child) = {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("completion VM");
+                    let mut root = host_function_process(&mut vm, "completion parent", None);
+                    if wasm_parent {
+                        root.runtime = GuestRuntimeKind::WebAssembly;
+                    }
+                    let child = javascript_process(
+                        &vm_id,
+                        &mut vm,
+                        "completion child",
+                        r#"
+const fs = require("node:fs/promises");
+Promise.allSettled(["/one", "/two", "/three"].map(path => fs.stat(path)));
+setInterval(() => {}, 60_000);
+"#,
+                        Arc::clone(&notify),
+                    );
+                    (root, child)
+                };
+                // Use real outstanding bridge calls so settling each completion
+                // exercises the production response path, not a mocked handler.
+                let mut request_ids = Vec::new();
+                for _ in 0..3 {
+                    let event = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        child.execution.poll_event(Duration::from_secs(2)),
+                    )
+                    .await
+                    .expect("async filesystem request deadline")
+                    .expect("poll async filesystem request")
+                    .expect("async filesystem request");
+                    let ActiveExecutionEvent::JavascriptSyncRpcRequest(request) = event else {
+                        panic!("expected async filesystem request, got {event:?}");
+                    };
+                    assert_eq!(request.method, "fs.promises.stat");
+                    request_ids.push(request.id);
+                }
+                for &request_id in &request_ids {
+                    child
+                        .queue_pending_execution_event(
+                            ActiveExecutionEvent::JavascriptSyncRpcCompletion(
+                                crate::state::JavascriptSyncRpcCompletion {
+                                    request_id,
+                                    result: Err(crate::state::DeferredRpcError {
+                                        code: String::from("ENOENT"),
+                                        message: String::from(
+                                            "completion fixture: file does not exist",
+                                        ),
+                                    }),
+                                },
+                            ),
+                        )
+                        .expect("queue completion");
+                }
+                root.child_processes.insert(child_id.clone(), child);
+                {
+                    let mut vm = sidecar.vms.get_mut(&vm_id).expect("completion VM");
+                    vm.active_processes.insert(root_id.clone(), root);
+                    if detached {
+                        vm.detached_child_processes
+                            .insert(format!("{root_id}/{child_id}"));
+                    }
+                }
+                let ownership =
+                    OwnershipScope::vm("child-claim-connection", "child-claim-session", &vm_id);
+                let mut remaining = request_ids;
+                while !remaining.is_empty() {
+                    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+                        .await
+                        .expect("completion work must retain a continuation edge");
+                    let mut javascript = Vec::new();
+                    if detached {
+                        sidecar
+                            .pump_detached_child_process_events_nowait(
+                                &vm_id,
+                                &mut javascript,
+                                &mut Vec::new(),
+                                &mut Vec::new(),
+                                &mut [],
+                                8,
+                            )
+                            .expect("pump detached completions");
+                    } else {
+                        let turn = sidecar
+                            .pump_process_events_nowait(&ownership, 8)
+                            .expect("pump attached completions");
+                        javascript = turn.javascript_services;
+                        assert!(turn.child_bridge_services.is_empty());
+                    }
+                    assert!(
+                        javascript.is_empty(),
+                        "completions do not stage owned services"
+                    );
+                    remaining.drain(..batch_size.min(remaining.len()));
+                    let vm = sidecar.vms.get(&vm_id).expect("completion VM");
+                    let child = &vm.active_processes[&root_id].child_processes[&child_id];
+                    let queued = child
+                        .pending_execution_events
+                        .iter()
+                        .filter_map(|event| match event {
+                            ActiveExecutionEvent::JavascriptSyncRpcCompletion(completion) => {
+                                Some(completion.request_id)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(queued, remaining,
+                        "detached={detached}, wasm_parent={wasm_parent}, vm_quantum={vm_quantum}, child_quantum={child_quantum}");
+                }
+                consume_notify_permit(&notify).await;
+                if detached {
+                    sidecar
+                        .pump_detached_child_process_events_nowait(
+                            &vm_id,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            &mut [],
+                            8,
+                        )
+                        .expect("empty detached completion turn");
+                } else {
+                    sidecar
+                        .pump_process_events_nowait(&ownership, 8)
+                        .expect("empty attached completion turn");
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), notify.notified())
+                        .await
+                        .is_err(),
+                    "empty completion turns must not hot-rearm"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attached_completions_make_bounded_progress_after_coalesced_notify() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_child_completions_make_bounded_progress(false))
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_completions_make_bounded_progress_after_coalesced_notify() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_child_completions_make_bounded_progress(true))
             .await;
     }
 

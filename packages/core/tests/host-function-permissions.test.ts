@@ -1,23 +1,12 @@
-import common from "@agentos-software/common";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
-import { AgentOs, hostFunction, hostFunctions } from "../src/index.js";
+import { AgentOs } from "../src/index.js";
 import { NativeSidecarProcessClient } from "../src/sidecar/rpc-client.js";
 
 // ---------------------------------------------------------------------------
-// Adversarial host_callback RPC tests (security review: aos-ts N-001/N-002).
-//
-// THREAT MODEL: untrusted guest / agent code can emit a raw `host_callback`
-// sidecar-request frame whose `callback_key` and `input` it fully controls.
-// The CLI command path (`agentos-<collection> <hostFunction>`) is gated by `hostFunctionPermissionMode`
-// via `invokeHostFunction`, but the raw `host_callback` RPC path is handled by
-// `handleHostCallback` in agent-os.ts. These tests play the guest and assert
-// the system DENIES the call (execute must never run) when policy denies or the
-// hostFunction is out of the granted pattern scope.
-//
-// We capture the real `SidecarRequestHandler` that `AgentOs.create()` installs
-// on the native sidecar client (via a prototype spy), then feed it forged
-// `host_callback` frames — exactly the bytes an untrusted guest controls.
+// The sidecar owns hostFunction.invoke permission enforcement. These tests
+// capture the trusted callback handler installed by AgentOs.create() and verify
+// that it dispatches only the callback key the sidecar already authorized.
 // ---------------------------------------------------------------------------
 
 type CapturedHandler = (request: any) => Promise<any> | any;
@@ -67,11 +56,8 @@ function hostCallbackFrame(callbackKey: string, input: unknown) {
 	};
 }
 
-// A forged *command-shaped* host_callback. `handleHostCallback` dispatches any
-// input that parses as `{type:'command',command,args,cwd}` through the SECOND
-// branch (`handleHostCommandCallback` -> `handleAgentOsHostFunctionCommand` ->
-// `invokeHostFunction`), bypassing the `callback_key`/Zod path entirely. We forge a
-// CLI-style command frame to confirm THAT branch also enforces hostFunction.invoke.
+// Registry callbacks use a command envelope, but only the reserved `agentos`
+// callback key may select that dispatch path.
 function commandHostCallbackFrame(command: string, args: string[]) {
 	return {
 		frame_type: "sidecar_request" as const,
@@ -79,9 +65,7 @@ function commandHostCallbackFrame(command: string, args: string[]) {
 		payload: {
 			type: "host_callback" as const,
 			invocation_id: "guest-forged-cmd-1",
-			// callback_key is irrelevant on the command branch; set it to a hostFunction
-			// that DOES exist to prove the command branch is what runs.
-			callback_key: "math:add",
+			callback_key: "agentos",
 			input: {
 				type: "command",
 				command,
@@ -120,7 +104,7 @@ const duplicateMathFunctions = {
 async function runCommand(vm: AgentOs, command: string, args: string[]) {
 	const stdoutChunks: string[] = [];
 	const stderrChunks: string[] = [];
-	const { pid } = vm.spawn(command, args, {
+	const { pid } = await vm.process.spawn(command, args, {
 		onStdout: (chunk) => {
 			stdoutChunks.push(new TextDecoder().decode(chunk));
 		},
@@ -130,7 +114,7 @@ async function runCommand(vm: AgentOs, command: string, args: string[]) {
 	});
 
 	return {
-		exitCode: await vm.waitProcess(pid),
+		exitCode: (await vm.process.wait(pid)).exitCode,
 		stdout: stdoutChunks.join(""),
 		stderr: stderrChunks.join(""),
 	};
@@ -154,7 +138,6 @@ describe("hostFunction collection permissions", () => {
 
 	test("allows hostFunction collection invocation with default permissions", async () => {
 		vm = await AgentOs.create({
-			software: [common],
 			hostFunctions: { math: mathFunctions },
 		});
 
@@ -172,13 +155,13 @@ describe("hostFunction collection permissions", () => {
 		});
 	});
 
-	test("denies hostFunction collection invocation by default until hostFunction permissions are granted", async () => {
+	test("denies hostFunction collection invocation when hostFunction permissions deny it", async () => {
 		vm = await AgentOs.create({
-			software: [common],
 			hostFunctions: { math: mathFunctions },
 			permissions: {
 				fs: "allow",
 				childProcess: "allow",
+				hostFunction: { default: "deny", rules: [] },
 			},
 		});
 
@@ -189,7 +172,7 @@ describe("hostFunction collection permissions", () => {
 			"--b",
 			"7",
 		]);
-		expect(result.exitCode).toBe(1);
+		expect(result.exitCode, JSON.stringify(result)).toBe(1);
 		expect(result.stdout).toBe("");
 		expect(result.stderr).toContain("hostFunction.invoke");
 		expect(result.stderr).toContain("math:add");
@@ -197,7 +180,6 @@ describe("hostFunction collection permissions", () => {
 
 	test("allows hostFunction collection invocation when a matching hostFunction permission is granted", async () => {
 		vm = await AgentOs.create({
-			software: [common],
 			hostFunctions: { math: mathFunctions },
 			permissions: {
 				fs: "allow",
@@ -238,97 +220,48 @@ describe("host-function collection permissions: raw host_callback RPC path", () 
 		vm = null;
 	});
 
-	// N-001 (J.1/J.2): host_callback RPC must honor hostFunction.invoke deny.
-	test("denies host_callback RPC hostFunction invocation when hostFunction.invoke policy is deny (not just the CLI path)", async () => {
-		const executed: unknown[] = [];
-		const spyFunctions = {
-			add: {
-				inputSchema: z
-					.object({ a: z.number(), b: z.number() })
-					.describe("Add two numbers"),
-				execute: ({ a, b }) => {
-					executed.push({ a, b });
-					return { sum: a + b };
-				},
-			},
-		};
-
-		const created = await createVmCapturingHandler({
-			// No `software` needed: this exercises the raw host_callback RPC
-			// handler directly (the guest-controlled path), which does not spawn
-			// any in-VM CLI. Keeping the VM minimal makes the safeguard fast.
-			hostFunctions: { math: spyFunctions },
-			permissions: {
-				fs: "allow",
-				childProcess: "allow",
-				// Deny-by-default: no hostFunction.invoke grant for math:add.
-				hostFunction: { default: "deny", rules: [] },
-			},
-		});
-		vm = created.vm;
-
-		const response = await created.handler(
-			hostCallbackFrame("math:add", { a: 2, b: 3 }),
-		);
-
-		// The attacker must be denied: execute MUST NOT have run, and the
-		// response must surface a policy denial rather than a result.
-		expect(executed).toHaveLength(0);
-		expect(response.type).toBe("host_callback_result");
-		expect(response.result).toBeUndefined();
-		expect(typeof response.error).toBe("string");
-		expect(response.error).toMatch(
-			/hostFunction\.invoke|EACCES|denied|permission/i,
-		);
-	});
-
-	// N-002 (J.2): host_callback RPC must respect hostFunction.invoke pattern scope.
-	test("host_callback RPC respects hostFunction.invoke pattern scope and denies a non-matching hostFunction", async () => {
+	test("command-shaped function input cannot redirect an authorized callback", async () => {
 		const executed: string[] = [];
-		const dangerFunctions = {
-			safe: {
-				inputSchema: z.object({ x: z.number() }).describe("Safe op"),
-				execute: ({ x }) => {
-					executed.push("safe");
-					return { x };
+		const functions = {
+			allowed: {
+				inputSchema: z.object({
+					type: z.literal("command"),
+					command: z.string(),
+					args: z.array(z.string()),
+					cwd: z.string(),
+				}),
+				execute: () => {
+					executed.push("allowed");
+					return "allowed";
 				},
 			},
 			danger: {
-				inputSchema: z.object({ x: z.number() }).describe("Dangerous op"),
-				execute: ({ x }) => {
+				inputSchema: z.object({}),
+				execute: () => {
 					executed.push("danger");
-					return { x };
+					return "danger";
 				},
 			},
 		};
 
 		const created = await createVmCapturingHandler({
-			hostFunctions: { math: dangerFunctions },
-			permissions: {
-				fs: "allow",
-				childProcess: "allow",
-				// Only math:safe is allowed; math:danger is out of scope -> deny.
-				hostFunction: {
-					default: "deny",
-					rules: [
-						{ mode: "allow", operations: ["invoke"], patterns: ["math:safe"] },
-					],
-				},
-			},
+			hostFunctions: { math: functions },
 		});
 		vm = created.vm;
 
 		const response = await created.handler(
-			hostCallbackFrame("math:danger", { x: 1 }),
+			hostCallbackFrame("math:allowed", {
+				type: "command",
+				command: "agentos-math",
+				args: ["danger"],
+				cwd: "/workspace",
+			}),
 		);
 
-		expect(executed).not.toContain("danger");
+		expect(executed).toEqual(["allowed"]);
 		expect(response.type).toBe("host_callback_result");
-		expect(response.result).toBeUndefined();
-		expect(typeof response.error).toBe("string");
-		expect(response.error).toMatch(
-			/hostFunction\.invoke|EACCES|denied|permission/i,
-		);
+		expect(response.result).toBe("allowed");
+		expect(response.error).toBeUndefined();
 	});
 
 	// AOSFS-1 (P1, J.1/J.2): the raw host_callback RPC path is fully
@@ -447,12 +380,7 @@ describe("host-function collection permissions: raw host_callback RPC path", () 
 		expect(response.error).toMatch(/number|expected|required|invalid|nan/i);
 	});
 
-	// AOS-SESS-4 (N-014, P2, J.1/J.2): the *command-shaped* host_callback dispatch
-	// branch (handleHostCommandCallback -> invokeHostFunction) must ALSO honor
-	// hostFunction.invoke deny is defense-in-depth on the second dispatch path that the
-	// callback_key/Zod branch does not cover. (Hold-as-regression; not a
-	// re-discovery — assert the gate holds on this branch.)
-	test("forged {type:'command'} host_callback is denied by hostFunction.invoke on the command dispatch branch", async () => {
+	test("registry callback rejects a mismatched command envelope", async () => {
 		const executed: unknown[] = [];
 		const spyFunctions = {
 			add: {
@@ -468,28 +396,17 @@ describe("host-function collection permissions: raw host_callback RPC path", () 
 
 		const created = await createVmCapturingHandler({
 			hostFunctions: { math: spyFunctions },
-			permissions: {
-				fs: "allow",
-				childProcess: "allow",
-				// Deny-by-default: no hostFunction.invoke grant for math:add.
-				hostFunction: { default: "deny", rules: [] },
-			},
 		});
 		vm = created.vm;
 
-		// Forge `agentos-math add --a 2 --b 3` as a command host_callback.
 		const response = await created.handler(
 			commandHostCallbackFrame("agentos-math", ["add", "--a", "2", "--b", "3"]),
 		);
 
-		// The attacker must be denied on the command branch too: execute MUST NOT
-		// have run and the response must surface a policy denial, not a result.
 		expect(executed).toHaveLength(0);
 		expect(response.type).toBe("host_callback_result");
 		expect(response.result).toBeUndefined();
 		expect(typeof response.error).toBe("string");
-		expect(response.error).toMatch(
-			/hostFunction\.invoke|EACCES|denied|permission/i,
-		);
+		expect(response.error).toMatch(/invalid registry callback/i);
 	});
 });

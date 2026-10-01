@@ -13,6 +13,7 @@ import type {
 	NativeMountPluginDescriptor,
 } from "@rivet-dev/agentos-runtime-core/descriptors";
 import * as executionProtocol from "@rivet-dev/agentos-runtime-core/protocol";
+import type { LivePackageAcquisitionSource } from "@rivet-dev/agentos-runtime-core/request-payloads";
 import { SidecarRejectedError } from "@rivet-dev/agentos-runtime-core/sidecar-errors";
 import type {
 	CreateVmConfig,
@@ -28,11 +29,6 @@ import {
 } from "@rivet-dev/agentos-runtime-core/host-functions";
 import { zodToJsonSchema } from "@rivet-dev/agentos-runtime-core/host-functions-zod";
 import type {
-	JsonRpcNotification,
-	JsonRpcRequest,
-	JsonRpcResponse,
-} from "./json-rpc.js";
-import type {
 	CodeEvaluationResult,
 	CodeExecutionResult,
 	ContextDescriptor,
@@ -40,6 +36,7 @@ import type {
 	InlineExecutionOptions,
 	JavaScriptEvaluationOptions,
 	JavaScriptExecutionOptions,
+	JsonValue,
 	LanguageExecutionOptions,
 	LanguageSpawnOptions,
 	NpmPackageInstallOptions,
@@ -47,7 +44,6 @@ import type {
 	OutputReplay,
 	ProcessDescriptor,
 	ProcessExit,
-	ProcessOutputEvent,
 	PythonInstallOptions,
 	SpawnOptions,
 	TypeScriptCheckOptions,
@@ -58,6 +54,7 @@ import type {
 	TypeScriptFileExecutionOptions,
 } from "./language-execution.js";
 import { parseAgentOsOptions } from "./options-schema.js";
+import { buildProcessForest } from "./process-forest.js";
 import type {
 	ConnectTerminalOptions,
 	Kernel,
@@ -77,31 +74,13 @@ import {
 	getSandboxDisposeHooks,
 	resolveSandboxOptions,
 } from "./sandbox.js";
-import type {
-	AcpSessionEvent,
-	CancelPromptResult,
-	PromptResult as DurablePromptResult,
-	DurableSessionEventEntry,
-	SessionInfo as DurableSessionInfo,
-	EphemeralSessionEventEntry,
-	HistoryPage,
-	JsonValue,
-	ListSessionsInput,
-	OpenSessionInput,
-	PermissionResponse,
-	PermissionResponseResult,
-	PermissionTerminalReason,
-	PromptInput,
-	ReadHistoryInput,
-	SessionAgentInfo,
-	SessionCapabilities,
-	SessionConfig,
-	SessionPage,
-	SessionStreamEntry,
-	SessionTarget,
-	SetSessionConfigOptionInput,
-} from "./session-api.js";
 import { resolvePublishedSidecarBinary } from "./sidecar/binary.js";
+import {
+	replayPage,
+	replayPageLimits,
+	replayWirePageLimits,
+	type ReplayReadOptions,
+} from "./output-replay.js";
 import { findCargoBinary, resolveCargoBinary } from "./sidecar/cargo.js";
 
 export type {
@@ -111,173 +90,8 @@ export type {
 	NativeMountPluginDescriptor,
 } from "@rivet-dev/agentos-runtime-core/descriptors";
 export type { ConnectTerminalOptions } from "./runtime-compat.js";
-export type * from "./session-api.js";
 
-const ACP_PROTOCOL_VERSION = 1;
-const ACP_EXTENSION_NAMESPACE = "dev.rivet.agent-os.acp";
-const SHELL_DISPOSE_TIMEOUT_MS = 5_000;
-const PROCESS_OUTPUT_EVENT_LIMIT = 1_024;
-
-function safeWireU64(value: bigint): number {
-	const result = Number(value);
-	if (!Number.isSafeInteger(result) || result < 0) {
-		throw new RangeError(
-			`wire integer ${value} exceeds JavaScript's safe range`,
-		);
-	}
-	return result;
-}
-
-function decodeDurableSessionInfo(
-	value: AcpDurableSessionInfo,
-): DurableSessionInfo {
-	return {
-		sessionId: value.sessionId,
-		agent: value.agent,
-		cwd: value.cwd,
-		additionalDirectories: JSON.parse(value.additionalDirectories),
-		state: JSON.parse(value.state),
-		latestSequence: safeWireU64(value.latestSequence),
-		title: value.title ?? undefined,
-		metadata: value.metadata === null ? undefined : JSON.parse(value.metadata),
-		createdAt: value.createdAt,
-		updatedAt: value.updatedAt,
-	};
-}
-
-const PERMISSION_TERMINAL_REASONS = new Set<PermissionTerminalReason>([
-	"already_resolved",
-	"prompt_cancelled",
-	"adapter_exited",
-	"session_deleted",
-	"vm_shutdown",
-	"request_not_found",
-]);
-
-function permissionTerminalReason(
-	value: string | null,
-): PermissionTerminalReason {
-	if (
-		value !== null &&
-		PERMISSION_TERMINAL_REASONS.has(value as PermissionTerminalReason)
-	) {
-		return value as PermissionTerminalReason;
-	}
-	throw new Error(`invalid permission terminal reason: ${value ?? "missing"}`);
-}
-
-function decodeDurableSessionEvent(value: {
-	sessionId: string;
-	sequence: bigint;
-	timestamp: string;
-	event: AcpDurableEvent;
-}): DurableSessionEventEntry {
-	const envelope = {
-		durability: "durable" as const,
-		sessionId: value.sessionId,
-		sequence: safeWireU64(value.sequence),
-		timestamp: value.timestamp,
-	};
-	switch (value.event.tag) {
-		case "AcpDurableSessionUpdate": {
-			const update = JSON.parse(value.event.val.update) as {
-				sessionUpdate: AcpSessionEvent["type"];
-			} & Record<string, unknown>;
-			const { sessionUpdate: type, ...payload } = update;
-			return {
-				...envelope,
-				type,
-				...payload,
-			} as DurableSessionEventEntry;
-		}
-		case "AcpDurablePermissionRequest": {
-			const request = JSON.parse(value.event.val.request) as {
-				sessionId: string;
-			} & Record<string, unknown>;
-			const { sessionId: _sessionId, ...payload } = request;
-			return {
-				...envelope,
-				type: "permission_request",
-				requestId: value.event.val.requestId,
-				...payload,
-			} as DurableSessionEventEntry;
-		}
-		case "AcpDurablePermissionResponse": {
-			const status = value.event.val.status;
-			if (status !== "accepted" && status !== "not_pending") {
-				throw new Error(`invalid permission response event status: ${status}`);
-			}
-			const response = JSON.parse(value.event.val.response) as Record<
-				string,
-				unknown
-			>;
-			return {
-				...envelope,
-				type: "permission_response",
-				requestId: value.event.val.requestId,
-				...response,
-				status,
-				...(value.event.val.reason === null
-					? {}
-					: { reason: permissionTerminalReason(value.event.val.reason) }),
-			} as DurableSessionEventEntry;
-		}
-	}
-}
-
-function normalizeSessionCapabilities(value: unknown): SessionCapabilities {
-	const capabilities = toRecord(value);
-	const prompt = toRecord(capabilities.promptCapabilities);
-	const mcp = toRecord(capabilities.mcpCapabilities);
-	const session = toRecord(capabilities.sessionCapabilities);
-	const extensions = Object.fromEntries(
-		Object.entries(capabilities).filter(
-			([key]) =>
-				!(
-					[
-						"loadSession",
-						"promptCapabilities",
-						"mcpCapabilities",
-						"sessionCapabilities",
-					] as const
-				).includes(key as never),
-		),
-	) as Record<string, JsonValue>;
-	return {
-		protocolVersion: ACP_PROTOCOL_VERSION,
-		loadSession: capabilities.loadSession === true,
-		...(Object.keys(prompt).length > 0
-			? {
-					prompt: {
-						audio: prompt.audio === true || undefined,
-						embeddedContext: prompt.embeddedContext === true || undefined,
-						image: prompt.image === true || undefined,
-					},
-				}
-			: {}),
-		...(Object.keys(mcp).length > 0
-			? {
-					mcp: {
-						http: mcp.http === true || undefined,
-						sse: mcp.sse === true || undefined,
-					},
-				}
-			: {}),
-		...(Object.keys(session).length > 0
-			? {
-					session: {
-						list: typeof session.list === "object" || undefined,
-						resume: typeof session.resume === "object" || undefined,
-						close: typeof session.close === "object" || undefined,
-						delete: typeof session.delete === "object" || undefined,
-						additionalDirectories:
-							typeof session.additionalDirectories === "object" || undefined,
-					},
-				}
-			: {}),
-		...(Object.keys(extensions).length > 0 ? { extensions } : {}),
-	};
-}
+const VM_DISPOSE_DRAIN_TIMEOUT_MS = 5_000;
 
 async function waitForTrackedExitPromises(
 	promises: Promise<unknown>[],
@@ -344,6 +158,9 @@ export interface ProcessOutput {
 	pid: number;
 	stream: "stdout" | "stderr";
 	data: Uint8Array;
+	/** Sidecar replay identity, absent when output retention is disabled. */
+	sequence?: number;
+	timestampMs?: number;
 }
 
 export interface ShellData {
@@ -406,10 +223,18 @@ export interface BatchReadResult {
 	error?: string;
 }
 
-/** Entry in the agent registry, describing an available agent type. */
-export interface AgentRegistryEntry {
-	id: string;
-	installed: boolean;
+/** The hosted actor accepts only URL sources; embedded Core also accepts trusted paths. */
+export type SoftwarePackageSource =
+	| { type: "url"; url: string; expectedDigest?: string }
+	| { type: "path"; path: string; expectedDigest?: string };
+
+export interface InstalledSoftware {
+	packageId: string;
+	digest: string;
+	sizeBytes: bigint;
+	packageName: string;
+	version: string;
+	commands: string[];
 }
 
 import {
@@ -448,19 +273,7 @@ import {
 } from "./layers.js";
 import type { SoftwareInput, SoftwareRoot } from "./packages.js";
 import type { PermissionTier } from "./runtime.js";
-import { createNodeHostNetworkAdapter } from "./runtime-compat.js";
-import {
-	type AcpDurableEvent,
-	type AcpDurableSessionInfo,
-	type AcpRequest,
-	type AcpResponse,
-	AcpRuntimeKind,
-	decodeAcpCallback,
-	decodeAcpEvent,
-	decodeAcpResponse,
-	encodeAcpCallbackResponse,
-	encodeAcpRequest,
-} from "./sidecar/agentos-protocol.js";
+import { allowAll, createNodeHostNetworkAdapter } from "./runtime-compat.js";
 import { serializePermissionsForSidecar } from "./sidecar/permissions.js";
 import {
 	type AgentOsSidecarClient,
@@ -552,15 +365,6 @@ interface AgentOsVmAdmin extends InProcessSidecarVmAdmin {
 	hostFunctionReference: string;
 }
 
-interface AcpTerminalEntry {
-	handle: ShellHandle;
-	output: string;
-	truncated: boolean;
-	outputByteLimit: number;
-	exitCode: number | null;
-	waitPromise: Promise<number>;
-}
-
 interface ShellEntry {
 	handle: ShellHandle;
 	dataHandlers: Set<(event: ShellData) => void>;
@@ -591,10 +395,8 @@ export type RootFilesystemConfig =
 	| OverlayRootFilesystemConfig
 	| NativeRootFilesystemConfig;
 
-/** VM-scoped SQLite storage shared by VFS and AgentOS durable state. */
-export type VmSqliteConfig =
-	| { type: "actor_uds"; path: string }
-	| { type: "sqlite_file"; path: string };
+/** Temporary local VM-scoped SQLite storage. */
+export type VmSqliteConfig = { type: "sqlite_file"; path: string };
 
 /**
  * Compatibility path for arbitrary caller-supplied filesystems.
@@ -647,6 +449,8 @@ export type MountConfig =
  * non-integer values are rejected by the sidecar before VM construction.
  */
 export interface AgentOsLimits {
+	/** Maximum package-owned filesystem leaves projected into one VM. */
+	agentosPackages?: { maxMounts?: number };
 	/** Kernel resource limits (processes, FDs, sockets, filesystem bytes, WASM caps, etc.). */
 	resources?: {
 		cpuCount?: number;
@@ -695,21 +499,7 @@ export interface AgentOsLimits {
 		maxPersistedManifestBytes?: number;
 		maxPersistedManifestFileBytes?: number;
 	};
-	/** ACP adapter, active-turn, history-retention, and page limits. */
-	acp?: {
-		maxReadLineBytes?: number;
-		stdoutBufferByteLimit?: number;
-		maxCompletedMessageBytes?: number;
-		maxTurnOutputBytes?: number;
-		maxPromptBytes?: number;
-		maxPromptBlocks?: number;
-		maxFallbackContinuationBytes?: number;
-		maxSessionHistoryBytes?: number;
-		maxSessionHistoryEvents?: number;
-		maxHistoryPageEntries?: number;
-		maxSessionListEntries?: number;
-	};
-	/** Shared local-file/actor-UDS SQLite result materialization limit. */
+	/** Local SQLite result materialization limit. */
 	sqlite?: {
 		maxResultBytes?: number;
 	};
@@ -741,6 +531,12 @@ export interface AgentOsLimits {
 		runnerHeapLimitMb?: number;
 		runnerCpuTimeLimitMs?: number;
 	};
+	/** Completed language-execution retention and live execution warning threshold. */
+	execution?: {
+		completedTtlMs?: number;
+		maxCompletedExecutions?: number;
+		liveExecutionWarningThreshold?: number;
+	};
 	/** Process spawn, I/O, and lifecycle-event backlog limits. */
 	process?: {
 		maxSpawnFileActions?: number;
@@ -749,55 +545,6 @@ export interface AgentOsLimits {
 		pendingEventCount?: number;
 		pendingEventBytes?: number;
 	};
-}
-
-export interface AgentStderrEvent {
-	sessionId: string;
-	agentType: string;
-	processId: string;
-	pid: number | null;
-	chunk: Uint8Array;
-}
-
-export type AgentStderrHandler = (event: AgentStderrEvent) => void;
-
-function defaultAgentStderrHandler(event: AgentStderrEvent): void {
-	process.stderr.write(event.chunk);
-}
-
-/**
- * Restart disposition reported on an {@link AgentExitEvent}. AgentOS never
- * respawns an adapter or replays an interrupted request implicitly.
- */
-export type AgentRestartOutcome = "not_attempted";
-
-/**
- * An unexpected ACP adapter process exit — a crash from the host's
- * perspective (any spontaneous exit before `unloadSession()`, including exit
- * code 0). The live route is evicted and must be restored explicitly.
- */
-export interface AgentExitEvent {
-	sessionId: string;
-	agentType: string;
-	/** Sidecar process id of the adapter that exited. */
-	processId: string;
-	pid: number | null;
-	/** Adapter exit code; `null` when the exit was observed indirectly. */
-	exitCode: number | null;
-	/** Always `"not_attempted"`; AgentOS does not restart adapters implicitly. */
-	restart: AgentRestartOutcome;
-	/** Always zero. */
-	restartCount: number;
-	/** Always zero. */
-	maxRestarts: number;
-}
-
-export type AgentExitHandler = (event: AgentExitEvent) => void;
-
-function defaultAgentExitHandler(event: AgentExitEvent): void {
-	process.stderr.write(
-		`[agentos] agent adapter exited unexpectedly: session=${event.sessionId} agent=${event.agentType} exitCode=${event.exitCode ?? "unknown"}; restore explicitly before retrying\n`,
-	);
 }
 
 /**
@@ -834,13 +581,18 @@ export interface AgentOsOptions<
 	/** Initial virtual Linux credentials and account record. Defaults to `1000:1000` (`agentos`). */
 	user?: VmUserConfig;
 	/**
+	 * Complete initial VM environment. Omission selects Core's base environment;
+	 * an explicit empty object starts with an empty environment.
+	 */
+	environment?: Record<string, string>;
+	/**
 	 * Software to install in the VM. Each entry is a package-dir ref. Arrays are
 	 * flattened, so meta-packages that export arrays of sub-packages work directly.
 	 */
 	software?: SoftwareInput[];
 	/**
-	 * Whether to auto-include the default software bundle (`@agentos-software/common`
-	 * — `sh` + coreutils + the standard CLI tools agents rely on) in addition to
+	 * Whether to auto-include Core's vendored default software bundle (`sh`,
+	 * coreutils, and the standard CLI tools programs rely on) in addition to
 	 * any `software` you pass. Defaults to `true`; set `false` for a bare VM with
 	 * only the software you list explicitly. Entries already present in `software`
 	 * are not duplicated.
@@ -861,7 +613,7 @@ export interface AgentOsOptions<
 	 * profiling workloads.
 	 */
 	highResolutionTime?: boolean;
-	/** Durable SQLite storage for VM-owned filesystem and session state. */
+	/** Durable SQLite storage for VM-owned filesystem and runtime state. */
 	database?: VmSqliteConfig;
 	/** Root filesystem configuration. Defaults to an overlay with the bundled base snapshot as its deepest lower. */
 	rootFilesystem?: RootFilesystemConfig;
@@ -871,13 +623,14 @@ export interface AgentOsOptions<
 	sandbox?: AgentOsSandboxInput;
 	/** Custom schedule driver for cron jobs. Defaults to TimerScheduleDriver. */
 	scheduleDriver?: ScheduleDriver;
-	/** Host functions available to agents inside the VM. */
+	/** Trusted host functions available to programs inside the VM. */
 	hostFunctions?: HostFunctionCollections<HOST_FUNCTIONS>;
 	/**
 	 * Permission policy for the kernel. By default the guest behaves like a
 	 * sandboxed machine: its virtual filesystem, processes, environment, listeners,
-	 * and loopback networking work, while external network access is denied. Your
-	 * policy is merged over that default, so an omitted scope keeps it.
+	 * and loopback networking work. External network access is limited to the
+	 * sidecar-owned agentOS service allowlist. Your policy is merged over that
+	 * default, so an omitted scope keeps it.
 	 */
 	permissions?: Permissions;
 	/**
@@ -891,20 +644,6 @@ export interface AgentOsOptions<
 	 */
 	limits?: AgentOsLimits;
 	/**
-	 * Called with stderr chunks from the top-level ACP-speaking agent process.
-	 * The agent process uses stdout for ACP JSON-RPC protocol traffic, so only
-	 * stderr is forwarded through this hook. Defaults to writing chunks to
-	 * `process.stderr`.
-	 */
-	onAgentStderr?: AgentStderrHandler;
-	/**
-	 * Called when the ACP adapter process behind a session exits unexpectedly.
-	 * The sidecar evicts the live
-	 * route and never retries the adapter or interrupted request implicitly.
-	 * Defaults to writing a warning line to `process.stderr`.
-	 */
-	onAgentExit?: AgentExitHandler;
-	/**
 	 * Called when a bounded limit inside the VM runtime approaches capacity
 	 * (~80%, edge-triggered with hysteresis so it does not spam). Use it to alert
 	 * on a slow consumer or a runaway guest before the limit is actually hit.
@@ -917,66 +656,6 @@ export interface AgentOsRuntimeAdmin {
 	rootView: VirtualFileSystem;
 	env: Record<string, string>;
 	sidecar: AgentOsSidecar;
-}
-
-class AcpDispatchError extends Error {
-	readonly code: number;
-	readonly data?: Record<string, unknown>;
-
-	constructor(code: number, message: string, data?: Record<string, unknown>) {
-		super(message);
-		this.name = "AcpDispatchError";
-		this.code = code;
-		this.data = data;
-	}
-}
-
-function toJsonRpcNotification(value: unknown): JsonRpcNotification {
-	if (
-		!value ||
-		typeof value !== "object" ||
-		Array.isArray(value) ||
-		(value as { jsonrpc?: unknown }).jsonrpc !== "2.0" ||
-		typeof (value as { method?: unknown }).method !== "string"
-	) {
-		throw new Error("Invalid JSON-RPC notification from sidecar");
-	}
-	return value as JsonRpcNotification;
-}
-
-function toJsonRpcResponse(value: unknown): JsonRpcResponse {
-	if (
-		!value ||
-		typeof value !== "object" ||
-		Array.isArray(value) ||
-		(value as { jsonrpc?: unknown }).jsonrpc !== "2.0" ||
-		!(
-			typeof (value as { id?: unknown }).id === "number" ||
-			typeof (value as { id?: unknown }).id === "string" ||
-			(value as { id?: unknown }).id === null
-		)
-	) {
-		throw new Error("Invalid JSON-RPC response from sidecar");
-	}
-	return value as JsonRpcResponse;
-}
-
-function toJsonRpcRequest(value: unknown): JsonRpcRequest {
-	if (
-		!value ||
-		typeof value !== "object" ||
-		Array.isArray(value) ||
-		(value as { jsonrpc?: unknown }).jsonrpc !== "2.0" ||
-		!(
-			typeof (value as { id?: unknown }).id === "number" ||
-			typeof (value as { id?: unknown }).id === "string" ||
-			(value as { id?: unknown }).id === null
-		) ||
-		typeof (value as { method?: unknown }).method !== "string"
-	) {
-		throw new Error("Invalid JSON-RPC request from ACP callback");
-	}
-	return value as JsonRpcRequest;
 }
 
 function toRecord(value: unknown): Record<string, unknown> {
@@ -1015,6 +694,8 @@ function normalizePackageRef(value: unknown): NormalizedPackageRef | undefined {
 }
 
 const CLOSED_SHELL_ID_RETENTION_LIMIT = 2048;
+const TERMINAL_LIMIT = 1024;
+const PROCESS_REGISTRY_LIMIT = 1024;
 
 class BoundedSet<T, V = undefined> {
 	readonly limit: number;
@@ -1316,18 +997,8 @@ const KERNEL_POSIX_BOOTSTRAP_DIR_METADATA: Record<
 	"/var/tmp": { mode: "1777", uid: 0, gid: 0 },
 };
 
-// Runtime commands that get a `/bin/<cmd>` stub at bootstrap so the guest shell
-// resolves them on PATH (e.g. `sh -c "python ..."`, pipelines). The sidecar
-// intercepts these by name and routes them to the embedded V8 / Pyodide runtime.
-const RUNTIME_BOOTSTRAP_COMMANDS = [
-	"node",
-	"npm",
-	"npx",
-	"python",
-	"python3",
-] as const;
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
-const SIDECAR_BINARY = join(REPO_ROOT, "target/debug/agentos-sidecar");
+const SIDECAR_BINARY = join(REPO_ROOT, "target/debug/agentos-native-sidecar");
 const SIDECAR_BUILD_INPUTS = [
 	join(REPO_ROOT, "Cargo.toml"),
 	join(REPO_ROOT, "Cargo.lock"),
@@ -1335,8 +1006,6 @@ const SIDECAR_BUILD_INPUTS = [
 	join(REPO_ROOT, "crates/build-support"),
 	join(REPO_ROOT, "crates/execution"),
 	join(REPO_ROOT, "crates/kernel"),
-	join(REPO_ROOT, "crates/agentos-protocol"),
-	join(REPO_ROOT, "crates/agentos-sidecar"),
 	join(REPO_ROOT, "crates/native-sidecar"),
 	join(REPO_ROOT, "crates/native-sidecar-core"),
 	join(REPO_ROOT, "crates/sidecar-protocol"),
@@ -1558,14 +1227,18 @@ function ensureNativeSidecarBinary(): string {
 	if (sidecarBinaryNeedsBuild()) {
 		const cargoBinary = findCargoBinary();
 		if (cargoBinary) {
-			execFileSync(cargoBinary, ["build", "-q", "-p", "agentos-sidecar"], {
-				cwd: REPO_ROOT,
-				stdio: "pipe",
-			});
+			execFileSync(
+				cargoBinary,
+				["build", "-q", "-p", "agentos-native-sidecar"],
+				{
+					cwd: REPO_ROOT,
+					stdio: "pipe",
+				},
+			);
 		} else if (!existsSync(SIDECAR_BINARY)) {
 			execFileSync(
 				resolveCargoBinary(),
-				["build", "-q", "-p", "agentos-sidecar"],
+				["build", "-q", "-p", "agentos-native-sidecar"],
 				{
 					cwd: REPO_ROOT,
 					stdio: "pipe",
@@ -1950,8 +1623,15 @@ async function handleHostCallback(
 		};
 	}
 
-	const command = parseHostCommandCallbackInput(payload.input);
-	if (command) {
+	if (payload.callback_key === "agentos") {
+		const command = parseHostCommandCallbackInput(payload.input);
+		if (!command || command.command !== payload.callback_key) {
+			return {
+				type: "host_callback_result",
+				invocation_id: payload.invocation_id,
+				error: `Invalid registry callback for "${payload.callback_key}"`,
+			};
+		}
 		try {
 			return {
 				type: "host_callback_result",
@@ -1976,8 +1656,9 @@ async function handleHostCallback(
 		};
 	}
 
-	// The sidecar checks the `hostFunction` permission scope before it forwards a
-	// host function call, so a call that reaches the host is already permitted.
+	// The sidecar authorizes this exact callback key before forwarding it. Never
+	// reinterpret direct callback input as a registry command: a valid function
+	// schema may itself accept command-shaped data.
 
 	const parsed = definition.inputSchema.safeParse(payload.input);
 	if (!parsed.success) {
@@ -2911,11 +2592,6 @@ function mapExecutionCompletedEvent(
 export class AgentOs {
 	#kernel: Kernel;
 	readonly sidecar: AgentOsSidecar;
-	private _durableSessionEventHandlers = new Map<
-		string,
-		Set<(entry: SessionStreamEntry) => void>
-	>();
-	private _agentExitHandlers = new Map<string, Set<AgentExitHandler>>();
 	private _processes = new Map<
 		number,
 		{
@@ -2924,8 +2600,7 @@ export class AgentOs {
 			args: string[];
 			startedAtMs: number;
 			retainEvents: boolean;
-			events: ProcessOutputEvent[];
-			nextSequence: number;
+			processId?: string;
 			signal?: ExecutionSignal;
 			exit?: ProcessExit;
 			outputHandlers: Set<(event: ProcessOutput) => void>;
@@ -2944,6 +2619,7 @@ export class AgentOs {
 		}
 	>();
 	private _languageProcessIds = new Map<string, number>();
+	private _pendingProcessRegistrations = 0;
 	private _executionOutputHandlers = new Map<
 		string,
 		Set<(event: InternalExecutionOutputEvent) => void>
@@ -2958,11 +2634,14 @@ export class AgentOs {
 	private _closedShellIds = new BoundedSet<string, number>(
 		CLOSED_SHELL_ID_RETENTION_LIMIT,
 	);
+	private _closedShellErrors = new BoundedSet<string, unknown>(
+		CLOSED_SHELL_ID_RETENTION_LIMIT,
+	);
 	private _pendingShellExitPromises = new Set<Promise<number>>();
 	private _shellCounter = 0;
-	private _acpTerminals = new Map<string, AcpTerminalEntry>();
-	private _acpTerminalCounter = 0;
 	private _softwareRoots: SoftwareRoot[];
+	private readonly _installedSoftware = new Map<string, InstalledSoftware>();
+	private _vmMutationActive = false;
 	private _cronManager!: CronManager;
 	private _hostFunctions: ResolvedHostFunctions[] = [];
 	private _hostFunctionReference = "";
@@ -2974,8 +2653,6 @@ export class AgentOs {
 	private readonly _sidecarSession: AuthenticatedSession;
 	private readonly _sidecarVm: CreatedVm;
 	private readonly _disposeSidecarEventListener: () => void;
-	private readonly _agentStderrHandler?: AgentStderrHandler;
-	private readonly _agentExitHandler?: AgentExitHandler;
 	private readonly _limitWarningHandler?: LimitWarningHandler;
 	private readonly _disposeHooks: Array<() => void | Promise<void>> = [];
 
@@ -3076,26 +2753,9 @@ export class AgentOs {
 	readonly software = {
 		list: this._listSoftware.bind(this),
 		link: this._linkSoftware.bind(this),
-	};
-
-	readonly agents = {
-		list: this._listAgents.bind(this),
-	};
-
-	readonly sessions = {
-		open: this._openSession.bind(this),
-		get: this._getSession.bind(this),
-		list: this._listSessions.bind(this),
-		delete: this._deleteSession.bind(this),
-		unload: this._unloadSession.bind(this),
-		prompt: this._prompt.bind(this),
-		cancelPrompt: this._cancelPrompt.bind(this),
-		respondPermission: this._respondPermission.bind(this),
-		readHistory: this._readHistory.bind(this),
-		getConfig: this._getSessionConfig.bind(this),
-		setConfigOption: this._setSessionConfigOption.bind(this),
-		getCapabilities: this._getSessionCapabilities.bind(this),
-		getAgentInfo: this._getSessionAgentInfo.bind(this),
+		install: this._installSoftware.bind(this),
+		uninstall: this._uninstallSoftware.bind(this),
+		installed: this._installedSoftwareList.bind(this),
 	};
 
 	readonly cron = {
@@ -3114,8 +2774,6 @@ export class AgentOs {
 		sidecarClient: SidecarProcess,
 		sidecarSession: AuthenticatedSession,
 		sidecarVm: CreatedVm,
-		agentStderrHandler?: AgentStderrHandler,
-		agentExitHandler?: AgentExitHandler,
 		limitWarningHandler?: LimitWarningHandler,
 	) {
 		this.#kernel = kernel;
@@ -3127,8 +2785,6 @@ export class AgentOs {
 		this._sidecarClient = sidecarClient;
 		this._sidecarSession = sidecarSession;
 		this._sidecarVm = sidecarVm;
-		this._agentStderrHandler = agentStderrHandler;
-		this._agentExitHandler = agentExitHandler;
 		this._limitWarningHandler = limitWarningHandler;
 		this._disposeSidecarEventListener = this._sidecarClient.onEvent((event) => {
 			this._handleSidecarEvent(event);
@@ -3153,22 +2809,16 @@ export class AgentOs {
 		return getSharedAgentOsSidecarInternal(options);
 	}
 
-	static async create<HOST_FUNCTIONS extends HostFunctionSchemas>(
-		callerOptions?: AgentOsOptions<HOST_FUNCTIONS>,
+	static async create(
+		options?: AgentOsOptions,
+		/** @internal Product wrappers select a sidecar-owned default profile here. */
+		defaultsProfile: NonNullable<
+			CreateVmConfig["defaultsProfile"]
+		> = "agent_os",
 	): Promise<AgentOs> {
-		// The generic exists only so each `execute` infers its input from its own
-		// `inputSchema`. Past this point the concrete schemas carry no meaning, so
-		// the rest of `create()` works with the plain option type.
-		let options: AgentOsOptions | undefined = parseAgentOsOptions(
-			callerOptions as AgentOsOptions | undefined,
-		);
-		// Default software is FULLY DYNAMIC: this package's own NON-agent
-		// @agentos-software/* dependencies (e.g. common), each default-exporting
-		// its registry-built descriptor. Agent packages are NOT projected here —
-		// openSession({ agent: id }) links the matching agent dependency into the running
-		// VM on first use, so agent closures (and pi's V8 snapshot bundle) only
-		// enter VMs that run them. Unbuilt packages throw with build
-		// instructions; opt out via defaultSoftware: false.
+		options = parseAgentOsOptions(options);
+		// Default software is resolved from immutable `.aospkg` files vendored in
+		// this package. Runtime package resolution never consults npm.
 		const defaultSoftware =
 			options?.defaultSoftware === false ? [] : resolveDefaultSoftware();
 		const software: unknown[] =
@@ -3194,9 +2844,7 @@ export class AgentOs {
 			return [{ path: ref.path }];
 		});
 		// All package software is projected into `/opt/agentos` by the sidecar. The
-		// client stages nothing host-side and parses NO package manifests: the
-		// sidecar owns agent resolution, agent enumeration, and agent snapshot
-		// bundle loading from the projected package dirs.
+		// client stages nothing host-side and parses no package manifests.
 		const localMounts = await resolveCompatLocalMounts(options?.mounts);
 		// Keys become command names, so resolve and check them before anything
 		// else in `create()` allocates a sidecar or a sandbox.
@@ -3218,10 +2866,6 @@ export class AgentOs {
 			// stages packages host-side.
 			const hostFunctionBootstrapCommands =
 				collectHostFunctionBootstrapCommands(hostFunctions);
-			const bootstrapCommands = [
-				...RUNTIME_BOOTSTRAP_COMMANDS,
-				...hostFunctionBootstrapCommands,
-			];
 			const bootstrapLower = createKernelBootstrapLower(
 				options?.rootFilesystem,
 			);
@@ -3241,7 +2885,10 @@ export class AgentOs {
 			};
 
 			try {
-				const env: Record<string, string> = getBaseEnvironment();
+				const env: Record<string, string> =
+					options?.environment !== undefined
+						? { ...options.environment }
+						: getBaseEnvironment();
 				// Guest command paths. The sidecar owns the `/opt/agentos` projection and
 				// reports the exact projected package commands after `configureVm`.
 				// HostFunction-shim commands are added below.
@@ -3256,21 +2903,30 @@ export class AgentOs {
 				client = shared.client;
 				const session = shared.session;
 				nativeSession = session;
-				const sidecarPermissions = serializePermissionsForSidecar(
-					options?.permissions,
-				);
+				const hostPermissions = options?.permissions ?? {
+					...allowAll,
+					binding: "allow",
+				};
+				const sidecarPermissions = options?.permissions
+					? serializePermissionsForSidecar(options.permissions)
+					: undefined;
 				const createVmConfig: CreateVmConfig = {
-					env,
+					defaultsProfile,
+					...(options?.environment !== undefined
+						? { env: { ...options.environment } }
+						: {}),
 					database: options?.database,
 					...(options?.user ? { user: options.user } : {}),
 					rootFilesystem: serializeRootFilesystemForSidecar(
 						options?.rootFilesystem,
 						bootstrapLower,
 					),
-					permissions: sidecarPermissions,
+					...(sidecarPermissions ? { permissions: sidecarPermissions } : {}),
 					limits: options?.limits,
 					loopbackExemptPorts: options?.loopbackExemptPorts ?? [],
-					bootstrapCommands,
+					...(hostFunctionBootstrapCommands.length > 0
+						? { bootstrapCommands: hostFunctionBootstrapCommands }
+						: {}),
 					...(options?.rootFilesystem?.type === "native"
 						? {
 								nativeRoot: {
@@ -3321,7 +2977,7 @@ export class AgentOs {
 				);
 				const configuredVm = await client.configureVm(session, nativeVm, {
 					mounts: sidecarMounts,
-					permissions: sidecarPermissions,
+					permissions: undefined,
 					commandPermissions: {},
 					loopbackExemptPorts: options?.loopbackExemptPorts,
 					packages: sidecarPackages,
@@ -3355,7 +3011,7 @@ export class AgentOs {
 					cwd: "/workspace",
 					localMounts,
 					sidecarMounts,
-					permissions: sidecarPermissions,
+					permissions: undefined,
 					commandPermissions: {},
 					loopbackExemptPorts: options?.loopbackExemptPorts,
 					// Retained for runtime mount reconfigures: `configure_vm` is
@@ -3388,7 +3044,7 @@ export class AgentOs {
 					kernel,
 					rootView: rootBridge.createRootView(),
 					sidecarMounts,
-					sidecarPermissions,
+					sidecarPermissions: undefined,
 					commandPermissions: {},
 					loopbackExemptPorts: options?.loopbackExemptPorts,
 					sidecarClient: client,
@@ -3459,8 +3115,6 @@ export class AgentOs {
 				vmAdmin.sidecarClient,
 				vmAdmin.sidecarSession,
 				vmAdmin.sidecarVm,
-				options?.onAgentStderr ?? defaultAgentStderrHandler,
-				options?.onAgentExit ?? defaultAgentExitHandler,
 				options?.onLimitWarning,
 			);
 			vm._sidecarLease = sidecarLease;
@@ -3644,52 +3298,54 @@ export class AgentOs {
 				"contextId is not supported for spawned processes; contexts are for attached operations",
 			);
 		}
+		const releaseRegistrySlot = this._reserveProcessRegistrySlot();
 		const executionId = `process-${randomUUID()}`;
 		const internalOptions: LanguageExecutionOptions = {
 			...options,
 			output: options.output,
 		};
-		const admitted = (await this._executionOperation(
-			buildPayload(internalOptions, executionId),
-			internalOptions,
-			true,
-		)) as InternalBackgroundExecution;
-		const descriptor: ProcessDescriptor = {
-			pid: admitted.pid,
-			state: "running",
-			language,
-			startedAtMs: admitted.createdAtMs,
-		};
-		this._languageProcesses.set(admitted.pid, {
-			executionId: admitted.executionId,
-			descriptor,
-			outputHandlers: new Set(),
-			exitHandlers: new Set(),
-		});
-		this._languageProcessIds.set(admitted.executionId, admitted.pid);
-		const reconcileCompletion = async () => {
-			if (!this._languageProcesses.get(admitted.pid)?.exit) {
-				await this._waitProcess(admitted.pid);
-			}
-		};
-		if (admitted.completed) await reconcileCompletion();
-		else {
-			void admitted.completion
-				.then(reconcileCompletion)
-				.catch((error) =>
-					console.error(
-						"[agentos] failed to reconcile spawned process completion",
-						error,
-					),
-				);
-		}
-		if (options.signal) {
-			const abort = () => {
-				void this._killProcess(admitted.pid);
+		try {
+			const admitted = (await this._executionOperation(
+				buildPayload(internalOptions, executionId),
+				internalOptions,
+				true,
+			)) as InternalBackgroundExecution;
+			const descriptor: ProcessDescriptor = {
+				pid: admitted.pid,
+				state: "running",
+				language,
+				startedAtMs: admitted.createdAtMs,
 			};
-			options.signal.addEventListener("abort", abort, { once: true });
+			this._languageProcesses.set(admitted.pid, {
+				executionId: admitted.executionId,
+				descriptor,
+				outputHandlers: new Set(),
+				exitHandlers: new Set(),
+			});
+			this._languageProcessIds.set(admitted.executionId, admitted.pid);
+			releaseRegistrySlot();
+			const reconcileCompletion = async () => {
+				if (!this._languageProcesses.get(admitted.pid)?.exit) {
+					await this._waitProcess(admitted.pid);
+				}
+			};
+			if (admitted.completed) await reconcileCompletion();
+			else {
+				void admitted.completion
+					.then(reconcileCompletion)
+					.catch((error) =>
+						console.error(
+							"[agentos] failed to reconcile spawned process completion",
+							error,
+						),
+					);
+			}
+			return (
+				this._languageProcesses.get(admitted.pid)?.descriptor ?? descriptor
+			);
+		} finally {
+			releaseRegistrySlot();
 		}
-		return this._languageProcesses.get(admitted.pid)?.descriptor ?? descriptor;
 	}
 
 	private async _exec(
@@ -4524,8 +4180,7 @@ export class AgentOs {
 			args,
 			startedAtMs: Date.now(),
 			retainEvents,
-			events: [] as ProcessOutputEvent[],
-			nextSequence: 0,
+			processId: proc.processId,
 			signal: undefined as ExecutionSignal | undefined,
 			exit: undefined as ProcessExit | undefined,
 			outputHandlers,
@@ -4538,16 +4193,19 @@ export class AgentOs {
 		// requires exited processes to stay queryable (running:false, exitCode set).
 		// `_processes` is a process table for this VM's lifetime; it is freed wholesale
 		// in dispose(). (H5: the leak was that dispose() never cleared it.)
-		void proc.wait().then((code) => {
-			const exit: ProcessExit = {
-				pid: proc.pid,
-				outcome: entry.signal ? "signalled" : "exited",
-				exitCode: code,
-				...(entry.signal ? { signal: entry.signal } : {}),
-			};
-			entry.exit = exit;
-			for (const h of exitHandlers) h(exit);
-		});
+		void proc
+			.wait()
+			.then((code) => {
+				this._recordProcessExit(proc.pid, code);
+			})
+			.catch((error) => {
+				// A failed wait is not an exit event. Explicit process.wait calls retain
+				// the error, and callers may still signal an unconfirmed live process.
+				console.error(
+					`[agentOS] process ${proc.pid} exit observation failed`,
+					error,
+				);
+			});
 
 		return {
 			pid: proc.pid,
@@ -4557,61 +4215,143 @@ export class AgentOs {
 		};
 	}
 
+	private _recordProcessExit(pid: number, exitCode: number): void {
+		const entry = this._processes.get(pid);
+		if (!entry || entry.exit) return;
+		const exit: ProcessExit = {
+			pid,
+			exitCode,
+			outcome: entry.signal ? "signalled" : "exited",
+			...(entry.signal ? { signal: entry.signal } : {}),
+		};
+		entry.exit = exit;
+		for (const handler of entry.exitHandlers) {
+			try {
+				handler(exit);
+			} catch (error) {
+				console.error("[agentOS] process exit handler failed", error);
+			}
+		}
+	}
+
+	private _reserveProcessRegistrySlot(): () => void {
+		this._pruneExitedProcesses(this._pendingProcessRegistrations + 1);
+		const retained = this._processes.size + this._languageProcesses.size;
+		const admitted = retained + this._pendingProcessRegistrations + 1;
+		if (admitted > PROCESS_REGISTRY_LIMIT) {
+			throw Object.assign(
+				new Error(
+					`process registry limit ${PROCESS_REGISTRY_LIMIT} reached; wait for an exited process to be evicted or raise PROCESS_REGISTRY_LIMIT`,
+				),
+				{
+					code: "ERR_AGENTOS_RESOURCE_LIMIT",
+					limitName: "process_registry_entries",
+					configuredLimit: PROCESS_REGISTRY_LIMIT,
+					requested: admitted,
+					configurationPath: "PROCESS_REGISTRY_LIMIT",
+					unit: "processes",
+					scope: "vm",
+					operation: "process.spawn",
+					retryable: true,
+				},
+			);
+		}
+		this._pendingProcessRegistrations += 1;
+		if (admitted >= PROCESS_REGISTRY_LIMIT * 0.8) {
+			console.warn(
+				"[agentos] process registry admission approaches PROCESS_REGISTRY_LIMIT",
+				{ admitted, limit: PROCESS_REGISTRY_LIMIT },
+			);
+		}
+		let active = true;
+		return () => {
+			if (!active) return;
+			active = false;
+			this._pendingProcessRegistrations -= 1;
+		};
+	}
+
+	private _pruneExitedProcesses(reserveSlots: number): void {
+		const retained = this._processes.size + this._languageProcesses.size;
+		const target = Math.max(0, PROCESS_REGISTRY_LIMIT - reserveSlots);
+		let removeCount = retained - target;
+		if (removeCount <= 0) return;
+
+		const exited = [
+			...[...this._processes.entries()]
+				.filter(([, entry]) => entry.exit !== undefined)
+				.map(([pid, entry]) => ({
+					kind: "process" as const,
+					pid,
+					startedAtMs: entry.startedAtMs,
+				})),
+			...[...this._languageProcesses.entries()]
+				.filter(([, entry]) => entry.exit !== undefined)
+				.map(([pid, entry]) => ({
+					kind: "language" as const,
+					pid,
+					startedAtMs: entry.descriptor.startedAtMs,
+				})),
+		].sort(
+			(left, right) =>
+				left.startedAtMs - right.startedAtMs || left.pid - right.pid,
+		);
+
+		for (const entry of exited) {
+			if (removeCount <= 0) break;
+			if (entry.kind === "process") {
+				this._processes.delete(entry.pid);
+			} else {
+				const language = this._languageProcesses.get(entry.pid);
+				if (language) this._languageProcessIds.delete(language.executionId);
+				this._languageProcesses.delete(entry.pid);
+			}
+			removeCount -= 1;
+		}
+	}
+
 	private async _spawnProcess(
 		command: string,
 		args: string[] = [],
 		options: SpawnOptions = {},
 	): Promise<ProcessDescriptor> {
+		const releaseRegistrySlot = this._reserveProcessRegistrySlot();
 		const outputHandlers = new Set<(event: ProcessOutput) => void>();
 		const exitHandlers = new Set<(event: ProcessExit) => void>();
-		const recordOutput = (
-			channel: "stdout" | "stderr",
-			data: Uint8Array,
-		): void => {
-			const entry = this._processes.get(proc.pid);
-			if (!entry?.retainEvents) return;
-			if (entry.events.length >= PROCESS_OUTPUT_EVENT_LIMIT) {
-				entry.events.shift();
-			}
-			entry.events.push({
-				pid: proc.pid,
-				sequence: entry.nextSequence++,
-				channel,
-				chunk: data,
-				timestampMs: Date.now(),
+		let proc: ManagedProcess;
+		try {
+			proc = this.#kernel.spawn(command, args, {
+				cwd: options.cwd,
+				env: options.env,
+				stdin: options.stdin,
+				timeout: options.timeoutMs,
+				streamStdin: true,
+				retainOutput: options.output?.retainEvents ?? false,
+				onStdout: (data, metadata) => {
+					options?.onStdout?.(data);
+					for (const h of outputHandlers) {
+						h({ pid: proc.pid, stream: "stdout", data, ...metadata });
+					}
+				},
+				onStderr: (data, metadata) => {
+					options?.onStderr?.(data);
+					for (const h of outputHandlers) {
+						h({ pid: proc.pid, stream: "stderr", data, ...metadata });
+					}
+				},
 			});
-		};
 
-		const proc = this.#kernel.spawn(command, args, {
-			cwd: options.cwd,
-			env: options.env,
-			stdin: options.stdin,
-			timeout: options.timeoutMs,
-			streamStdin: true,
-			onStdout: (data) => {
-				recordOutput("stdout", data);
-				options?.onStdout?.(data);
-				for (const h of outputHandlers) {
-					h({ pid: proc.pid, stream: "stdout", data });
-				}
-			},
-			onStderr: (data) => {
-				recordOutput("stderr", data);
-				options?.onStderr?.(data);
-				for (const h of outputHandlers) {
-					h({ pid: proc.pid, stream: "stderr", data });
-				}
-			},
-		});
-
-		return this._trackProcess(
-			proc,
-			command,
-			args,
-			options.output?.retainEvents ?? false,
-			outputHandlers,
-			exitHandlers,
-		);
+			return this._trackProcess(
+				proc,
+				command,
+				args,
+				options.output?.retainEvents ?? false,
+				outputHandlers,
+				exitHandlers,
+			);
+		} finally {
+			releaseRegistrySlot();
+		}
 	}
 
 	spawn(
@@ -4684,6 +4424,7 @@ export class AgentOs {
 		if (language) {
 			if (language.exit) return language.exit;
 			const result = await this._waitExecutionResult(language.executionId);
+			if (language.exit) return language.exit;
 			const exit: ProcessExit = {
 				pid,
 				outcome:
@@ -4906,26 +4647,30 @@ export class AgentOs {
 	 * leaving the mount silently host-only.
 	 */
 	private async _mountFs(descriptor: DynamicMountDescriptor): Promise<void> {
-		this._assertSafeAbsolutePath(descriptor.path);
-		if (!(this.#kernel instanceof NativeSidecarKernelProxy)) {
-			throw new Error("portable dynamic mounts require the native sidecar");
-		}
-		await this.#kernel.mountDescriptor({
-			guestPath: descriptor.path,
-			readOnly: descriptor.readOnly ?? false,
-			plugin: {
-				id: descriptor.plugin.id,
-				config: descriptor.plugin.config ?? {},
-			},
+		return this._withVmMutation(async () => {
+			this._assertSafeAbsolutePath(descriptor.path);
+			if (!(this.#kernel instanceof NativeSidecarKernelProxy)) {
+				throw new Error("portable dynamic mounts require the native sidecar");
+			}
+			await this.#kernel.mountDescriptor({
+				guestPath: descriptor.path,
+				readOnly: descriptor.readOnly ?? false,
+				plugin: {
+					id: descriptor.plugin.id,
+					config: descriptor.plugin.config ?? {},
+				},
+			});
 		});
 	}
 
 	private async _unmountFs(path: string): Promise<void> {
-		this._assertSafeAbsolutePath(path);
-		if (!(this.#kernel instanceof NativeSidecarKernelProxy)) {
-			throw new Error("portable dynamic mounts require the native sidecar");
-		}
-		await this.#kernel.unmountDescriptor(path);
+		return this._withVmMutation(async () => {
+			this._assertSafeAbsolutePath(path);
+			if (!(this.#kernel instanceof NativeSidecarKernelProxy)) {
+				throw new Error("portable dynamic mounts require the native sidecar");
+			}
+			await this.#kernel.unmountDescriptor(path);
+		});
 	}
 
 	private async _listMounts(): Promise<MountInfo[]> {
@@ -5078,8 +4823,8 @@ export class AgentOs {
 
 	/**
 	 * Fetch an HTTP endpoint inside the VM while preserving duplicate response
-	 * headers and arbitrary binary bodies. agentOS Apps uses this compatibility
-	 * surface for its direct actor API.
+	 * headers and arbitrary binary bodies. This compatibility surface supports
+	 * fetch-like callers that proxy requests into a guest VM.
 	 */
 	async fetch(port: number, request: Request): Promise<Response> {
 		const url = new URL(request.url);
@@ -5180,6 +4925,33 @@ export class AgentOs {
 	}
 
 	private _openTerminal(options?: ShellOptions): { shellId: string } {
+		// Include closed-but-not-yet-exited terminals: close is not proof of exit.
+		if (this._pendingShellExitPromises.size >= TERMINAL_LIMIT) {
+			throw Object.assign(
+				new Error(
+					`terminal limit ${TERMINAL_LIMIT} reached; wait for existing terminals to exit or raise TERMINAL_LIMIT`,
+				),
+				{
+					code: "ERR_AGENTOS_RESOURCE_LIMIT",
+					limitName: "active_terminals",
+					configuredLimit: TERMINAL_LIMIT,
+					requested: TERMINAL_LIMIT + 1,
+					configurationPath: "TERMINAL_LIMIT",
+					unit: "terminals",
+					scope: "vm",
+					retryable: true,
+				},
+			);
+		}
+		if (this._pendingShellExitPromises.size + 1 >= TERMINAL_LIMIT * 0.8) {
+			console.warn(
+				"[agentos] terminal admission approaches TERMINAL_LIMIT; close unused terminals",
+				{
+					active: this._pendingShellExitPromises.size + 1,
+					limit: TERMINAL_LIMIT,
+				},
+			);
+		}
 		const shellId = `shell-${++this._shellCounter}`;
 		this._closedShellIds.delete(shellId);
 		const dataHandlers = new Set<(event: ShellData) => void>();
@@ -5220,10 +4992,18 @@ export class AgentOs {
 				return exitCode;
 			},
 			(error) => {
+				this._closedShellErrors.add(shellId, error);
 				finalize();
 				throw error;
 			},
 		);
+		// Preserve rejection for wait() without leaving an unobserved promise.
+		void entry.exitPromise.catch((error: unknown) => {
+			console.error("[agentos] terminal ended without a confirmed exit", {
+				shellId,
+				error,
+			});
+		});
 		this._pendingShellExitPromises.add(entry.exitPromise);
 		this._shells.set(shellId, entry);
 		return { shellId };
@@ -5304,6 +5084,9 @@ export class AgentOs {
 	private _waitTerminal(shellId: string): Promise<number> {
 		const entry = this._shells.get(shellId);
 		if (!entry) {
+			if (this._closedShellErrors.has(shellId)) {
+				return Promise.reject(this._closedShellErrors.get(shellId));
+			}
 			const exitCode = this._closedShellIds.get(shellId);
 			if (exitCode !== undefined) return Promise.resolve(exitCode);
 			throw new Error(`Shell not found: ${shellId}`);
@@ -5371,10 +5154,10 @@ export class AgentOs {
 	private async _listProcesses(): Promise<ProcessDescriptor[]> {
 		return [
 			...[...this._processes.values()].map(
-				({ proc, command, startedAtMs }): ProcessDescriptor => ({
+				({ proc, command, startedAtMs, exit }): ProcessDescriptor => ({
 					pid: proc.pid,
 					command,
-					state: proc.exitCode === null ? "running" : "exited",
+					state: exit || proc.exitCode !== null ? "exited" : "running",
 					startedAtMs,
 				}),
 			),
@@ -5392,41 +5175,36 @@ export class AgentOs {
 
 	/** Returns processes organized as a tree using ppid relationships. */
 	private async _processTree(): Promise<ProcessTreeNode[]> {
-		const all = this._listAllProcesses();
-		const nodeMap = new Map<number, ProcessTreeNode>();
-
-		// Index: create a tree node for each process
-		for (const proc of all) {
-			nodeMap.set(proc.pid, {
+		const records =
+			this.#kernel instanceof NativeSidecarKernelProxy
+				? this.#kernel.snapshotProcessTopology()
+				: this._listAllProcesses().map((info) => ({
+						info,
+						key: `kernel:${info.pid}`,
+						parentKey: `kernel:${info.ppid}`,
+					}));
+		const roots = buildProcessForest<KernelProcessInfo, ProcessTreeNode>(
+			records,
+			(proc, children) => ({
 				pid: proc.pid,
 				ppid: proc.ppid,
 				command: proc.command,
 				state: proc.status,
 				startedAtMs: proc.startTime,
-				children: [],
-			});
-		}
+				children,
+			}),
+		);
+		const kernelKeys = new Set(records.map((record) => record.key));
 		for (const process of this._languageProcesses.values()) {
-			if (!nodeMap.has(process.descriptor.pid)) {
-				nodeMap.set(process.descriptor.pid, {
+			// Language admission returns a raw kernel PID and bypasses the proxy's
+			// synthetic spawn registry. A matching display PID is not identity.
+			if (!kernelKeys.has(`kernel:${process.descriptor.pid}`)) {
+				roots.push({
 					...process.descriptor,
 					children: [],
 				});
 			}
 		}
-
-		// Wire: attach each node to its parent
-		const roots: ProcessTreeNode[] = [];
-		for (const node of nodeMap.values()) {
-			const parent =
-				node.ppid === undefined ? undefined : nodeMap.get(node.ppid);
-			if (parent) {
-				parent.children.push(node);
-			} else {
-				roots.push(node);
-			}
-		}
-
 		return roots;
 	}
 
@@ -5441,7 +5219,7 @@ export class AgentOs {
 		return {
 			pid: entry.proc.pid,
 			command: entry.command,
-			state: entry.proc.exitCode === null ? "running" : "exited",
+			state: entry.exit || entry.proc.exitCode !== null ? "exited" : "running",
 			startedAtMs: entry.startedAtMs,
 		};
 	}
@@ -5452,8 +5230,22 @@ export class AgentOs {
 	): Promise<void> {
 		const language = this._languageProcesses.get(pid);
 		if (language) {
+			if (language.exit) return;
 			language.signal = signal;
-			await this._signalExecution(language.executionId, signal);
+			try {
+				await this._signalExecution(language.executionId, signal);
+			} catch (error) {
+				if (
+					!(error instanceof SidecarRejectedError) ||
+					error.detail.code !== "execution_not_running"
+				) {
+					throw error;
+				}
+				// The execution can finish between the local state check and the
+				// signal request. Reconcile its final state and preserve kill/signal's
+				// documented already-exited no-op behavior.
+				await this._waitProcess(pid);
+			}
 			return;
 		}
 		const entry = this._processes.get(pid);
@@ -5484,27 +5276,30 @@ export class AgentOs {
 
 	private async _readProcessOutput(
 		pid: number,
-		options: { after?: number } = {},
+		options: ReplayReadOptions = {},
 	): Promise<OutputReplay> {
+		const { maxEvents } = replayPageLimits(options);
 		const language = this._languageProcesses.get(pid);
 		if (language) {
 			const page = await this._readExecutionOutput(language.executionId, {
+				limit: maxEvents,
 				cursor:
 					options.after === undefined ? undefined : `1:${options.after + 1}`,
 			});
-			return {
+			const replay = replayPage(
 				pid,
-				events: page.events.map((event) => ({
+				page.events.map((event) => ({
 					pid,
 					sequence: event.sequence,
 					channel: event.channel,
 					chunk: event.chunk,
 					timestampMs: event.timestampMs,
 				})),
-				nextCursor: page.nextCursor,
-				hasMore: page.hasMore,
-				truncated: page.truncated,
-			};
+				options,
+				page.truncated ? (options.after ?? -1) + 1 : undefined,
+				page.hasMore,
+			);
+			return { ...replay, exitCode: language.exit?.exitCode ?? null };
 		}
 		const entry = this._processes.get(pid);
 		if (!entry) throw new Error(`Process not found: ${pid}`);
@@ -5513,369 +5308,166 @@ export class AgentOs {
 				`Process ${pid} was not spawned with output.retainEvents enabled`,
 			);
 		}
-		const after = options.after ?? -1;
-		const events = entry.events.filter((event) => event.sequence > after);
-		return {
-			pid,
-			events,
-			nextCursor: String(events.at(-1)?.sequence ?? after),
-			hasMore: false,
-			truncated:
-				entry.events.length === PROCESS_OUTPUT_EVENT_LIMIT &&
-				after < (entry.events[0]?.sequence ?? 0) - 1,
-		};
-	}
-
-	private async _openSession(input: OpenSessionInput): Promise<void> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpOpenSessionRequest",
-			val: {
-				sessionId: input.sessionId ?? null,
-				agent: input.agent,
-				cwd: input.cwd ?? null,
-				additionalDirectories:
-					input.additionalDirectories === undefined
-						? null
-						: JSON.stringify(input.additionalDirectories),
-				env: input.env === undefined ? null : JSON.stringify(input.env),
-				mcpServers:
-					input.mcpServers === undefined
-						? null
-						: JSON.stringify(input.mcpServers),
-				permissionPolicy: input.permissionPolicy ?? null,
-				skipOsInstructions: input.skipOsInstructions ?? null,
-				additionalInstructions:
-					combineInstructions(
-						input.additionalInstructions,
-						this._hostFunctionReference,
-					) ?? null,
-			},
-		});
-		if (response.tag !== "AcpOpenSessionResponse") {
-			throw new Error(`unexpected openSession response: ${response.tag}`);
-		}
-	}
-
-	private async _getSession(
-		input?: SessionTarget,
-	): Promise<DurableSessionInfo> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpGetDurableSessionRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpGetDurableSessionResponse") {
-			throw new Error(`unexpected getSession response: ${response.tag}`);
-		}
-		return decodeDurableSessionInfo(response.val.session);
-	}
-
-	private async _listSessions(input?: ListSessionsInput): Promise<SessionPage> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpListDurableSessionsRequest",
-			val: { cursor: input?.cursor ?? null, limit: input?.limit ?? null },
-		});
-		if (response.tag !== "AcpListDurableSessionsResponse") {
-			throw new Error(`unexpected listSessions response: ${response.tag}`);
-		}
-		return {
-			sessions: response.val.sessions.map(decodeDurableSessionInfo),
-			nextCursor: response.val.nextCursor,
-		};
-	}
-
-	private async _deleteSession(input: SessionTarget = {}): Promise<void> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpDeleteSessionRequest",
-			val: { sessionId: input.sessionId ?? null },
-		});
-		if (response.tag !== "AcpDeleteSessionResponse") {
-			throw new Error(`unexpected deleteSession response: ${response.tag}`);
-		}
-	}
-
-	private async _unloadSession(input?: SessionTarget): Promise<void> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpUnloadSessionRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpUnloadSessionResponse") {
-			throw new Error(`unexpected unloadSession response: ${response.tag}`);
-		}
-	}
-
-	private async _prompt(input: PromptInput): Promise<DurablePromptResult> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpPromptRequest",
-			val: {
-				sessionId: input.sessionId ?? null,
-				idempotencyKey: input.idempotencyKey ?? null,
-				content: JSON.stringify(input.content),
-			},
-		});
-		if (response.tag !== "AcpPromptResponse") {
-			throw new Error(`unexpected prompt response: ${response.tag}`);
-		}
-		return {
-			sessionId: response.val.sessionId,
-			message:
-				response.val.message === null ? null : JSON.parse(response.val.message),
-			stopReason: response.val.stopReason as DurablePromptResult["stopReason"],
-		};
-	}
-
-	private async _cancelPrompt(
-		input?: SessionTarget,
-	): Promise<CancelPromptResult> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpCancelPromptRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpCancelPromptResponse") {
-			throw new Error(`unexpected cancelPrompt response: ${response.tag}`);
-		}
-		if (
-			response.val.status !== "cancelled" &&
-			response.val.status !== "no_active_prompt"
-		) {
-			throw new Error(`invalid cancelPrompt status: ${response.val.status}`);
-		}
-		return { status: response.val.status };
-	}
-
-	private async _respondPermission(
-		input: PermissionResponse,
-	): Promise<PermissionResponseResult> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpRespondPermissionRequest",
-			val: {
-				sessionId: input.sessionId,
-				requestId: input.requestId,
-				optionId: input.optionId,
-			},
-		});
-		if (response.tag !== "AcpRespondPermissionResponse") {
-			throw new Error(`unexpected respondPermission response: ${response.tag}`);
-		}
-		if (
-			response.val.status !== "accepted" &&
-			response.val.status !== "not_pending"
-		) {
+		if (!entry.processId) {
 			throw new Error(
-				`invalid respondPermission status: ${response.val.status}`,
+				`Process ${pid} does not expose a sidecar replay identity`,
 			);
 		}
-		if (response.val.status === "accepted") {
-			if (response.val.reason !== null) {
-				throw new Error(
-					"accepted permission response must not include a reason",
-				);
-			}
-			return { status: "accepted" };
-		}
-		return {
-			status: "not_pending",
-			reason: permissionTerminalReason(response.val.reason),
-		};
-	}
-
-	private async _readHistory(input?: ReadHistoryInput): Promise<HistoryPage> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpReadHistoryRequest",
-			val: {
-				sessionId: input?.sessionId ?? null,
-				before: input?.before === undefined ? null : BigInt(input.before),
-				after: input?.after === undefined ? null : BigInt(input.after),
-				limit: input?.limit ?? null,
-			},
-		});
-		if (response.tag !== "AcpHistoryPageResponse") {
-			throw new Error(`unexpected readHistory response: ${response.tag}`);
-		}
-		return {
-			events: response.val.events.map(decodeDurableSessionEvent),
-			hasMoreBefore: response.val.hasMoreBefore,
-			hasMoreAfter: response.val.hasMoreAfter,
-		};
-	}
-
-	private async _getSessionConfig(
-		input?: SessionTarget,
-	): Promise<SessionConfig> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpGetSessionConfigRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpSessionConfigResponse") {
-			throw new Error(`unexpected getSessionConfig response: ${response.tag}`);
-		}
-		return {
-			revision: safeWireU64(response.val.revision),
-			options: JSON.parse(response.val.options),
-		};
-	}
-
-	private async _setSessionConfigOption(
-		input: SetSessionConfigOptionInput,
-	): Promise<SessionConfig> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpSetSessionConfigOptionRequest",
-			val: {
-				sessionId: input.sessionId ?? null,
-				configId: input.configId,
-				value: JSON.stringify(input.value),
-			},
-		});
-		if (response.tag !== "AcpSessionConfigResponse") {
-			throw new Error(
-				`unexpected setSessionConfigOption response: ${response.tag}`,
-			);
-		}
-		return {
-			revision: safeWireU64(response.val.revision),
-			options: JSON.parse(response.val.options),
-		};
-	}
-
-	private async _getSessionCapabilities(
-		input?: SessionTarget,
-	): Promise<SessionCapabilities | null> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpGetSessionCapabilitiesRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpSessionCapabilitiesResponse") {
-			throw new Error(
-				`unexpected getSessionCapabilities response: ${response.tag}`,
-			);
-		}
-		return response.val.capabilities === null
-			? null
-			: normalizeSessionCapabilities(JSON.parse(response.val.capabilities));
-	}
-
-	private async _getSessionAgentInfo(
-		input?: SessionTarget,
-	): Promise<SessionAgentInfo | null> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpGetSessionAgentInfoRequest",
-			val: { sessionId: input?.sessionId ?? null },
-		});
-		if (response.tag !== "AcpSessionAgentInfoResponse") {
-			throw new Error(
-				`unexpected getSessionAgentInfo response: ${response.tag}`,
-			);
-		}
-		return response.val.agentInfo === null
-			? null
-			: JSON.parse(response.val.agentInfo);
-	}
-
-	/** @deprecated Use `sessions.open()`. */
-	openSession(input: OpenSessionInput): Promise<void> {
-		return this.sessions.open(input);
-	}
-
-	/** @deprecated Use `sessions.get()`. */
-	getSession(input?: SessionTarget): Promise<DurableSessionInfo> {
-		return this.sessions.get(input);
-	}
-
-	/** @deprecated Use `sessions.list()`. */
-	listSessions(input?: ListSessionsInput): Promise<SessionPage> {
-		return this.sessions.list(input);
-	}
-
-	/** @deprecated Use `sessions.delete()`. */
-	deleteSession(input: SessionTarget = {}): Promise<void> {
-		return this.sessions.delete(input);
-	}
-
-	/** @deprecated Use `sessions.unload()`. */
-	unloadSession(input?: SessionTarget): Promise<void> {
-		return this.sessions.unload(input);
-	}
-
-	/** @deprecated Use `sessions.prompt()`. */
-	prompt(input: PromptInput): Promise<DurablePromptResult> {
-		return this.sessions.prompt(input);
-	}
-
-	/** @deprecated Use `sessions.cancelPrompt()`. */
-	cancelPrompt(input?: SessionTarget): Promise<CancelPromptResult> {
-		return this.sessions.cancelPrompt(input);
-	}
-
-	/** @deprecated Use `sessions.respondPermission()`. */
-	respondPermission(
-		input: PermissionResponse,
-	): Promise<PermissionResponseResult> {
-		return this.sessions.respondPermission(input);
-	}
-
-	/** @deprecated Use `sessions.readHistory()`. */
-	readHistory(input?: ReadHistoryInput): Promise<HistoryPage> {
-		return this.sessions.readHistory(input);
-	}
-
-	/** @deprecated Use `sessions.getConfig()`. */
-	getSessionConfig(input?: SessionTarget): Promise<SessionConfig> {
-		return this.sessions.getConfig(input);
-	}
-
-	/** @deprecated Use `sessions.setConfigOption()`. */
-	setSessionConfigOption(
-		input: SetSessionConfigOptionInput,
-	): Promise<SessionConfig> {
-		return this.sessions.setConfigOption(input);
-	}
-
-	/** @deprecated Use `sessions.getCapabilities()`. */
-	getSessionCapabilities(
-		input?: SessionTarget,
-	): Promise<SessionCapabilities | null> {
-		return this.sessions.getCapabilities(input);
-	}
-
-	/** @deprecated Use `sessions.getAgentInfo()`. */
-	getSessionAgentInfo(input?: SessionTarget): Promise<SessionAgentInfo | null> {
-		return this.sessions.getAgentInfo(input);
-	}
-
-	/**
-	 * Dynamically link a software package into the RUNNING VM. The package's
-	 * `bin/` commands appear under `/opt/agentos/bin` (on `$PATH`) and its `share/man`
-	 * pages under MANPATH immediately — the `/opt/agentos` mount is host-backed, so
-	 * writing into its staging dir is reflected live with no reboot. An `agent`
-	 * block registers the package for `openSession({ agent: name })`. Persists for the VM's
-	 * lifetime (and across a snapshot iff the volume persists).
-	 */
-	private async _linkSoftware(descriptor: PackageDescriptor): Promise<void> {
-		// Forward to the sidecar, which owns the `/opt/agentos` projection and
-		// appends the package to its live host-backed staging dir; the commands
-		// appear under `/opt/agentos/bin` immediately. The sidecar rejects a
-		// duplicate command, surfaced here as a thrown error.
-		const commands = await this._sidecarClient.linkPackage(
+		const wireLimits = replayWirePageLimits(options);
+		const response = await this._sidecarClient.sendVmRequest(
 			this._sidecarSession,
 			this._sidecarVm,
-			descriptor,
+			{
+				type: "read_process_output",
+				process_id: entry.processId,
+				...(options.after === undefined ? {} : { after: options.after }),
+				max_events: wireLimits.maxEvents,
+				max_bytes: wireLimits.maxBytes,
+			},
 		);
-		if (this.#kernel instanceof NativeSidecarKernelProxy) {
-			this.#kernel.registerCommandGuestPaths(
-				new Map(
-					commands.projectedCommands.map((command) => [
-						command.name,
-						command.guestPath,
-					]),
-				),
+		if (response.type !== "process_output_page") {
+			throw new Error(
+				`unexpected readProcessOutput response: ${response.type}`,
 			);
-			// Retain the linked package for runtime mount reconfigures:
-			// `configure_vm` is replace-on-write, so a later `mountFs` that
-			// resent only the boot packages would unproject this one.
-			this.#kernel.registerLinkedPackage(descriptor);
 		}
-		// The client parses no manifests: an `agent` block in the linked package is
-		// picked up by the sidecar (it owns the projected `/opt/agentos` and answers
-		// openSession/listAgents from it). Nothing to record client-side.
+		const exitCode = response.response.exitCode;
+		if (exitCode !== null && this._processes.get(pid) === entry) {
+			if (this.#kernel instanceof NativeSidecarKernelProxy) {
+				this.#kernel.reconcileReplayExit(entry.processId, exitCode);
+			}
+			this._recordProcessExit(pid, exitCode);
+		}
+		return {
+			pid,
+			exitCode,
+			events: response.response.events.map((event) => ({
+				pid,
+				sequence: safeProtocolNumber(event.sequence, "process output sequence"),
+				channel: event.channel.toLowerCase() as "stdout" | "stderr",
+				chunk: new Uint8Array(event.chunk),
+				timestampMs: safeProtocolNumber(
+					event.timestampMs,
+					"process output timestamp",
+				),
+			})),
+			nextCursor:
+				response.response.nextCursor === null
+					? null
+					: safeProtocolNumber(
+							response.response.nextCursor,
+							"process output cursor",
+						),
+			hasMore: response.response.hasMore,
+			truncated: response.response.truncated,
+		};
+	}
+
+	private async _withVmMutation<T>(operation: () => Promise<T>): Promise<T> {
+		if (this._vmMutationActive) {
+			throw new Error(
+				"invalid_state: another VM mount or software mutation is already in progress; wait for it to finish before retrying",
+			);
+		}
+		this._vmMutationActive = true;
+		try {
+			return await operation();
+		} finally {
+			this._vmMutationActive = false;
+		}
+	}
+
+	private async _linkSoftware(descriptor: PackageDescriptor): Promise<void> {
+		return this._withVmMutation(async () => {
+			// Forward to the sidecar, which owns the `/opt/agentos` projection and
+			// appends the package to its live host-backed staging dir; the commands
+			// appear under `/opt/agentos/bin` immediately. The sidecar rejects a
+			// duplicate command, surfaced here as a thrown error.
+			const commands = await this._sidecarClient.linkPackage(
+				this._sidecarSession,
+				this._sidecarVm,
+				descriptor,
+			);
+			if (this.#kernel instanceof NativeSidecarKernelProxy) {
+				this.#kernel.registerCommandGuestPaths(
+					new Map(
+						commands.projectedCommands.map((command) => [
+							command.name,
+							command.guestPath,
+						]),
+					),
+				);
+			}
+		});
+	}
+
+	private async _installSoftware(
+		source: SoftwarePackageSource,
+	): Promise<InstalledSoftware> {
+		return this._withVmMutation(async () => {
+			const wireSource: LivePackageAcquisitionSource =
+				source.type === "url"
+					? {
+							type: "url",
+							url: source.url,
+							expected_digest: source.expectedDigest,
+						}
+					: {
+							type: "path",
+							path: source.path,
+							expected_digest: source.expectedDigest,
+						};
+			const result = await this._sidecarClient.installPackage(
+				this._sidecarSession,
+				this._sidecarVm,
+				{ source: wireSource },
+			);
+			const packageInfo = result.package;
+			const installed: InstalledSoftware = {
+				packageId: packageInfo.package_id,
+				digest: packageInfo.digest,
+				sizeBytes: packageInfo.size,
+				packageName: packageInfo.package_name,
+				version: packageInfo.version,
+				commands: [...packageInfo.commands],
+			};
+			this._installedSoftware.set(installed.packageId, installed);
+			if (this.#kernel instanceof NativeSidecarKernelProxy) {
+				this.#kernel.registerCommandGuestPaths(
+					new Map(
+						result.projected_commands.map((command) => [
+							command.name,
+							command.guest_path,
+						]),
+					),
+				);
+			}
+			return { ...installed, commands: [...installed.commands] };
+		});
+	}
+
+	private async _uninstallSoftware(
+		packageId: string,
+	): Promise<InstalledSoftware> {
+		return this._withVmMutation(async () => {
+			const installed = this._installedSoftware.get(packageId);
+			if (!installed) throw new Error(`Software not found: ${packageId}`);
+			const removedCommands = await this._sidecarClient.unlinkPackage(
+				this._sidecarSession,
+				this._sidecarVm,
+				packageId,
+			);
+			this._installedSoftware.delete(packageId);
+			if (this.#kernel instanceof NativeSidecarKernelProxy) {
+				this.#kernel.unregisterCommandGuestPaths(removedCommands);
+			}
+			return { ...installed, commands: [...installed.commands] };
+		});
+	}
+
+	private _installedSoftwareList(): InstalledSoftware[] {
+		return [...this._installedSoftware.values()]
+			.sort((left, right) => left.packageId.localeCompare(right.packageId))
+			.map((software) => ({ ...software, commands: [...software.commands] }));
 	}
 
 	private async _listSoftware(): Promise<
@@ -5886,27 +5478,6 @@ export class AgentOs {
 			this._sidecarVm,
 		);
 	}
-
-	/**
-	 * Returns all registered agents with their installation status. Thin forwarder:
-	 * sends `AcpListAgentsRequest` and maps the response. The sidecar enumerates the
-	 * projected `/opt/agentos` packages (the client parses no manifests). Every such
-	 * agent is a package materialized into the VM, so `installed` is always `true`.
-	 */
-	private async _listAgents(): Promise<AgentRegistryEntry[]> {
-		const response = await this._sendAcpRequest({
-			tag: "AcpListAgentsRequest",
-			val: { reserved: false },
-		});
-		if (response.tag !== "AcpListAgentsResponse") {
-			throw new Error(`unexpected list_agents response: ${response.tag}`);
-		}
-		return response.val.agents.map((agent) => ({
-			id: agent.id,
-			installed: agent.installed,
-		}));
-	}
-
 	/** @deprecated Use `software.link()`. */
 	linkSoftware(descriptor: PackageDescriptor): Promise<void> {
 		return this.software.link(descriptor);
@@ -5917,76 +5488,6 @@ export class AgentOs {
 		return this.software.list();
 	}
 
-	/** @deprecated Use `agents.list()`. */
-	listAgents(): Promise<AgentRegistryEntry[]> {
-		return this.agents.list();
-	}
-
-	private _recordAgentStderr(event: {
-		sessionId: string;
-		agentType: string;
-		processId: string;
-		chunk: ArrayBuffer;
-	}): void {
-		if (!event.sessionId) {
-			return;
-		}
-		const handler = this._agentStderrHandler;
-		if (!handler) {
-			return;
-		}
-		try {
-			handler({
-				sessionId: event.sessionId,
-				agentType: event.agentType,
-				processId: event.processId,
-				pid: null,
-				chunk: new Uint8Array(event.chunk),
-			});
-		} catch (error) {
-			console.error("AgentOS stderr handler failed", error);
-		}
-	}
-
-	private _recordAgentExit(event: {
-		sessionId: string;
-		agentType: string;
-		processId: string;
-		pid: number | null;
-		exitCode: number | null;
-		restart: string;
-		restartCount: number;
-		maxRestarts: number;
-	}): void {
-		const publicEvent: AgentExitEvent = {
-			sessionId: event.sessionId,
-			agentType: event.agentType,
-			processId: event.processId,
-			pid: event.pid,
-			exitCode: event.exitCode,
-			restart: event.restart as AgentRestartOutcome,
-			restartCount: event.restartCount,
-			maxRestarts: event.maxRestarts,
-		};
-		const handler = this._agentExitHandler;
-		if (handler) {
-			try {
-				handler(publicEvent);
-			} catch (error) {
-				console.error("AgentOS agent-exit handler failed", error);
-			}
-		}
-		for (const key of ["*", event.sessionId]) {
-			for (const subscription of this._agentExitHandlers.get(key) ?? []) {
-				try {
-					subscription(publicEvent);
-				} catch (error) {
-					console.error("AgentOS agent-exit subscription failed", error);
-				}
-			}
-		}
-	}
-
 	private _handleSidecarEvent(
 		event: Parameters<SidecarProcess["onEvent"]>[0] extends (
 			event: infer T,
@@ -5994,6 +5495,15 @@ export class AgentOs {
 			? T
 			: never,
 	): void {
+		// onEvent is process-wide: execution IDs are only unique inside one VM.
+		// Keep sibling VMs' output/completion and warnings on their own handles.
+		if (
+			event.ownership.scope === "vm" &&
+			(event.ownership.connection_id !== this._sidecarSession.connectionId ||
+				event.ownership.session_id !== this._sidecarSession.sessionId ||
+				event.ownership.vm_id !== this._sidecarVm.vmId)
+		)
+			return;
 		if (event.payload.type === "execution_output") {
 			const output = mapExecutionOutputEvent(event.payload.event);
 			const pid = this._languageProcessIds.get(output.executionId);
@@ -6004,6 +5514,8 @@ export class AgentOs {
 						pid,
 						stream: output.channel === "stderr" ? "stderr" : "stdout",
 						data: output.chunk,
+						sequence: output.sequence,
+						timestampMs: output.timestampMs,
 					};
 					for (const handler of process.outputHandlers) {
 						try {
@@ -6066,10 +5578,6 @@ export class AgentOs {
 			}
 			return;
 		}
-		if (event.payload.type === "ext") {
-			this._handleAcpExtEvent(event.payload.envelope);
-			return;
-		}
 		if (event.payload.type !== "structured") {
 			return;
 		}
@@ -6099,85 +5607,6 @@ export class AgentOs {
 		}
 	}
 
-	private _handleAcpExtEvent(envelope: {
-		namespace: string;
-		payload: Uint8Array;
-	}): void {
-		if (envelope.namespace !== ACP_EXTENSION_NAMESPACE) {
-			return;
-		}
-		try {
-			const event = decodeAcpEvent(envelope.payload);
-			switch (event.tag) {
-				case "AcpDurableSessionEvent": {
-					this._emitDurableSessionEvent(decodeDurableSessionEvent(event.val));
-					return;
-				}
-				case "AcpEphemeralSessionUpdateEvent": {
-					const update = JSON.parse(event.val.update) as {
-						sessionUpdate: EphemeralSessionEventEntry["type"];
-					} & Record<string, unknown>;
-					const { sessionUpdate: type, ...payload } = update;
-					this._emitDurableSessionEvent({
-						durability: "ephemeral",
-						type,
-						sessionId: event.val.sessionId,
-						afterSequence: safeWireU64(event.val.afterSequence),
-						...payload,
-					} as EphemeralSessionEventEntry);
-					return;
-				}
-				case "AcpSessionEvent":
-					return;
-				case "AcpAgentStderrEvent": {
-					this._recordAgentStderr(event.val);
-					return;
-				}
-				case "AcpAgentExitedEvent": {
-					this._recordAgentExit(event.val);
-					return;
-				}
-			}
-		} catch (error) {
-			console.error("AgentOS failed to decode an ACP sidecar event", error);
-		}
-	}
-
-	private _emitDurableSessionEvent(entry: SessionStreamEntry): void {
-		for (const handler of this._durableSessionEventHandlers.get(
-			entry.sessionId,
-		) ?? []) {
-			try {
-				handler(entry);
-			} catch (error) {
-				console.error("AgentOS session event handler failed", error);
-			}
-		}
-	}
-
-	private async _sendAcpRequest(request: AcpRequest): Promise<AcpResponse> {
-		const envelope = await this._sidecarClient.extensionRequest(
-			this._sidecarSession,
-			this._sidecarVm,
-			{
-				namespace: ACP_EXTENSION_NAMESPACE,
-				payload: encodeAcpRequest(request),
-			},
-		);
-		if (envelope.namespace !== ACP_EXTENSION_NAMESPACE) {
-			throw new Error(`unexpected ACP Ext namespace: ${envelope.namespace}`);
-		}
-		const response = decodeAcpResponse(envelope.payload);
-		if (response.tag === "AcpErrorResponse") {
-			const error = new Error(response.val.message) as Error & {
-				code?: string;
-			};
-			error.code = response.val.code;
-			throw error;
-		}
-		return response;
-	}
-
 	private _installSidecarRequestHandler(): void {
 		const context: HostCallbackContext = {
 			hostFunctions: this._hostFunctions,
@@ -6193,554 +5622,18 @@ export class AgentOs {
 						filesystem: this.#kernel.vfs,
 					});
 				case "ext":
-					return this._handleAcpExtSidecarRequest(request.payload.envelope);
-			}
-		});
-	}
-
-	private async _handleAcpExtSidecarRequest(envelope: {
-		namespace: string;
-		payload: Uint8Array;
-	}): Promise<SidecarResponsePayload> {
-		if (envelope.namespace !== ACP_EXTENSION_NAMESPACE) {
-			return {
-				type: "ext_result",
-				envelope: {
-					namespace: envelope.namespace,
-					payload: Buffer.from("unknown extension namespace", "utf8"),
-				},
-			};
-		}
-		const callback = decodeAcpCallback(envelope.payload);
-		switch (callback.tag) {
-			case "AcpHostRequestCallback": {
-				const response = await this._dispatchAcpSidecarRequest(
-					toJsonRpcRequest(JSON.parse(callback.val.request)),
-				);
-				return {
-					type: "ext_result",
-					envelope: {
-						namespace: ACP_EXTENSION_NAMESPACE,
-						payload: encodeAcpCallbackResponse({
-							tag: "AcpHostRequestCallbackResponse",
-							val: {
-								response: JSON.stringify(response),
-							},
-						}),
-					},
-				};
-			}
-		}
-	}
-
-	private async _dispatchAcpSidecarRequest(
-		request: JsonRpcRequest,
-	): Promise<JsonRpcResponse> {
-		try {
-			const result = await this._handleSupportedAcpSidecarRequest(request);
-			return {
-				jsonrpc: "2.0",
-				id: request.id,
-				result,
-			};
-		} catch (error) {
-			if (error instanceof AcpDispatchError) {
-				return {
-					jsonrpc: "2.0",
-					id: request.id,
-					error: {
-						code: error.code,
-						message: error.message,
-						...(error.data ? { data: error.data } : {}),
-					},
-				};
-			}
-			return {
-				jsonrpc: "2.0",
-				id: request.id,
-				error: {
-					code: -32603,
-					message: error instanceof Error ? error.message : String(error),
-				},
-			};
-		}
-	}
-
-	private async _handleSupportedAcpSidecarRequest(
-		request: JsonRpcRequest,
-	): Promise<unknown> {
-		const params = this._acpParams(request);
-		switch (request.method) {
-			case "fs/read":
-			case "fs/read_text_file":
-				return this._handleAcpReadFile(params);
-			case "fs/write":
-			case "fs/write_text_file":
-				return this._handleAcpWriteFile(params);
-			case "fs/readDir":
-			case "fs/read_dir":
-				return this._handleAcpReadDir(params);
-			case "terminal/create":
-				return this._handleAcpCreateTerminal(params);
-			case "terminal/write":
-				return this._handleAcpWriteTerminal(params);
-			case "terminal/output":
-			case "terminal/read":
-				return this._handleAcpReadTerminal(params);
-			case "terminal/wait_for_exit":
-			case "terminal/waitForExit":
-				return this._handleAcpWaitForTerminalExit(params);
-			case "terminal/kill":
-				return this._handleAcpKillTerminal(params);
-			case "terminal/release":
-			case "terminal/close":
-				return this._handleAcpReleaseTerminal(params);
-			case "terminal/resize":
-				return this._handleAcpResizeTerminal(params);
-			default:
-				throw new AcpDispatchError(
-					-32601,
-					`Method not found: ${request.method}`,
-					{
-						method: request.method,
-					},
-				);
-		}
-	}
-
-	private _acpParams(request: JsonRpcRequest): Record<string, unknown> {
-		if (!request.params) {
-			return {};
-		}
-		if (
-			typeof request.params !== "object" ||
-			request.params === null ||
-			Array.isArray(request.params)
-		) {
-			throw new AcpDispatchError(
-				-32602,
-				`${request.method} requires object params`,
-			);
-		}
-		return request.params as Record<string, unknown>;
-	}
-
-	private _requireAcpStringParam(
-		params: Record<string, unknown>,
-		name: string,
-		method: string,
-	): string {
-		const value = params[name];
-		if (typeof value !== "string") {
-			throw new AcpDispatchError(-32602, `${method} requires a string ${name}`);
-		}
-		return value;
-	}
-
-	private _optionalAcpStringParam(
-		params: Record<string, unknown>,
-		name: string,
-		method: string,
-	): string | undefined {
-		const value = params[name];
-		if (value === undefined || value === null) {
-			return undefined;
-		}
-		if (typeof value !== "string") {
-			throw new AcpDispatchError(
-				-32602,
-				`${method} requires ${name} to be a string when provided`,
-			);
-		}
-		return value;
-	}
-
-	private _optionalAcpNumberParam(
-		params: Record<string, unknown>,
-		name: string,
-		method: string,
-	): number | undefined {
-		const value = params[name];
-		if (value === undefined || value === null) {
-			return undefined;
-		}
-		if (typeof value !== "number" || !Number.isFinite(value)) {
-			throw new AcpDispatchError(
-				-32602,
-				`${method} requires ${name} to be a number when provided`,
-			);
-		}
-		return value;
-	}
-
-	private _optionalAcpStringArrayParam(
-		params: Record<string, unknown>,
-		name: string,
-		method: string,
-	): string[] | undefined {
-		const value = params[name];
-		if (value === undefined || value === null) {
-			return undefined;
-		}
-		if (
-			!Array.isArray(value) ||
-			value.some((entry) => typeof entry !== "string")
-		) {
-			throw new AcpDispatchError(
-				-32602,
-				`${method} requires ${name} to be an array of strings when provided`,
-			);
-		}
-		return [...value];
-	}
-
-	private _optionalAcpEnvParam(
-		params: Record<string, unknown>,
-		name: string,
-		method: string,
-	): Record<string, string> | undefined {
-		const value = params[name];
-		if (value === undefined || value === null) {
-			return undefined;
-		}
-		if (Array.isArray(value)) {
-			const env: Record<string, string> = {};
-			for (const entry of value) {
-				if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-					throw new AcpDispatchError(
-						-32602,
-						`${method} requires ${name} entries to be { name, value } objects`,
-					);
-				}
-				const record = entry as Record<string, unknown>;
-				if (
-					typeof record.name !== "string" ||
-					typeof record.value !== "string"
-				) {
-					throw new AcpDispatchError(
-						-32602,
-						`${method} requires ${name} entries to be { name, value } objects`,
-					);
-				}
-				env[record.name] = record.value;
-			}
-			return env;
-		}
-		if (typeof value !== "object") {
-			throw new AcpDispatchError(
-				-32602,
-				`${method} requires ${name} to be an object or name/value array`,
-			);
-		}
-		const env: Record<string, string> = {};
-		for (const [key, entryValue] of Object.entries(
-			value as Record<string, unknown>,
-		)) {
-			if (typeof entryValue !== "string") {
-				throw new AcpDispatchError(
-					-32602,
-					`${method} requires ${name} values to be strings`,
-				);
-			}
-			env[key] = entryValue;
-		}
-		return env;
-	}
-
-	private _requireAcpTerminal(
-		params: Record<string, unknown>,
-		method: string,
-	): AcpTerminalEntry {
-		const terminalId = this._requireAcpStringParam(
-			params,
-			"terminalId",
-			method,
-		);
-		const terminal = this._acpTerminals.get(terminalId);
-		if (!terminal) {
-			throw new AcpDispatchError(
-				-32602,
-				`ACP terminal not found: ${terminalId}`,
-			);
-		}
-		return terminal;
-	}
-
-	private _appendAcpTerminalOutput(
-		terminal: AcpTerminalEntry,
-		data: Uint8Array,
-	): void {
-		const chunk = Buffer.from(data).toString("utf8");
-		if (!chunk) {
-			return;
-		}
-		terminal.output += chunk;
-		if (
-			Number.isFinite(terminal.outputByteLimit) &&
-			terminal.outputByteLimit >= 0 &&
-			terminal.output.length > terminal.outputByteLimit
-		) {
-			terminal.output = terminal.output.slice(
-				terminal.output.length - terminal.outputByteLimit,
-			);
-			terminal.truncated = true;
-		}
-	}
-
-	private async _handleAcpReadFile(
-		params: Record<string, unknown>,
-	): Promise<{ content: string }> {
-		const method = "fs/read";
-		const path = this._requireAcpStringParam(params, "path", method);
-		const line = this._optionalAcpNumberParam(params, "line", method);
-		const limit = this._optionalAcpNumberParam(params, "limit", method);
-		const encoding = this._optionalAcpStringParam(params, "encoding", method);
-		const bytes = await this.readFile(path);
-		if (encoding === "base64") {
-			return { content: Buffer.from(bytes).toString("base64") };
-		}
-		const text = new TextDecoder().decode(bytes);
-		if (line === undefined && limit === undefined) {
-			return { content: text };
-		}
-		const startLine = Math.max(1, Math.trunc(line ?? 1));
-		const lineLimit =
-			limit === undefined
-				? Number.POSITIVE_INFINITY
-				: Math.max(0, Math.trunc(limit));
-		return {
-			content: text
-				.split("\n")
-				.slice(startLine - 1, startLine - 1 + lineLimit)
-				.join("\n"),
-		};
-	}
-
-	private async _handleAcpWriteFile(
-		params: Record<string, unknown>,
-	): Promise<null> {
-		const method = "fs/write";
-		const path = this._requireAcpStringParam(params, "path", method);
-		const content = this._requireAcpStringParam(params, "content", method);
-		const encoding = this._optionalAcpStringParam(params, "encoding", method);
-		await this.writeFile(
-			path,
-			encoding === "base64" ? Buffer.from(content, "base64") : content,
-		);
-		return null;
-	}
-
-	private async _handleAcpReadDir(params: Record<string, unknown>): Promise<{
-		entries: Array<{
-			name: string;
-			path: string;
-			type: "file" | "directory" | "symlink";
-		}>;
-	}> {
-		const method = "fs/readDir";
-		const path = this._requireAcpStringParam(params, "path", method);
-		const entries = await this._vfs().readDirWithTypes(path);
-		return {
-			entries: entries
-				.filter((entry) => entry.name !== "." && entry.name !== "..")
-				.map((entry) => ({
-					name: entry.name,
-					path: path === "/" ? `/${entry.name}` : `${path}/${entry.name}`,
-					type: entry.isSymbolicLink
-						? "symlink"
-						: entry.isDirectory
-							? "directory"
-							: "file",
-				})),
-		};
-	}
-
-	private _handleAcpCreateTerminal(params: Record<string, unknown>): {
-		terminalId: string;
-	} {
-		const method = "terminal/create";
-		const command = this._requireAcpStringParam(params, "command", method);
-		const args = this._optionalAcpStringArrayParam(params, "args", method);
-		const env = this._optionalAcpEnvParam(params, "env", method);
-		const cwd = this._optionalAcpStringParam(params, "cwd", method);
-		const cols = this._optionalAcpNumberParam(params, "cols", method);
-		const rows = this._optionalAcpNumberParam(params, "rows", method);
-		const outputByteLimit = Math.max(
-			0,
-			Math.trunc(
-				this._optionalAcpNumberParam(params, "outputByteLimit", method) ??
-					1_048_576,
-			),
-		);
-		const terminalId = `acp-terminal-${++this._acpTerminalCounter}`;
-		const terminal: AcpTerminalEntry = {
-			handle: this.#kernel.openShell({
-				command,
-				...(args ? { args } : {}),
-				...(env ? { env } : {}),
-				...(cwd ? { cwd } : {}),
-				...(cols !== undefined ? { cols: Math.trunc(cols) } : {}),
-				...(rows !== undefined ? { rows: Math.trunc(rows) } : {}),
-			}),
-			output: "",
-			truncated: false,
-			outputByteLimit,
-			exitCode: null,
-			waitPromise: Promise.resolve(0),
-		};
-		terminal.handle.onData = (data) => {
-			this._appendAcpTerminalOutput(terminal, data);
-		};
-		terminal.waitPromise = terminal.handle.wait().then((exitCode) => {
-			terminal.exitCode = exitCode;
-			return exitCode;
-		});
-		this._acpTerminals.set(terminalId, terminal);
-		return { terminalId };
-	}
-
-	private async _handleAcpWriteTerminal(
-		params: Record<string, unknown>,
-	): Promise<null> {
-		const method = "terminal/write";
-		const terminal = this._requireAcpTerminal(params, method);
-		const data = this._requireAcpStringParam(params, "data", method);
-		const encoding = this._optionalAcpStringParam(params, "encoding", method);
-		await terminal.handle.write(
-			encoding === "base64" ? Buffer.from(data, "base64") : data,
-		);
-		return null;
-	}
-
-	private _handleAcpReadTerminal(params: Record<string, unknown>): {
-		output: string;
-		truncated: boolean;
-		exitStatus?: { exitCode: number; signal: null };
-	} {
-		const terminal = this._requireAcpTerminal(params, "terminal/output");
-		return {
-			output: terminal.output,
-			truncated: terminal.truncated,
-			...(terminal.exitCode !== null
-				? {
-						exitStatus: {
-							exitCode: terminal.exitCode,
-							signal: null,
+					return {
+						type: "ext_result",
+						envelope: {
+							namespace: request.payload.envelope.namespace,
+							payload: Buffer.from(
+								"extension handlers are not configured",
+								"utf8",
+							),
 						},
-					}
-				: {}),
-		};
-	}
-
-	private async _handleAcpWaitForTerminalExit(
-		params: Record<string, unknown>,
-	): Promise<{ exitCode: number; signal: null }> {
-		const terminal = this._requireAcpTerminal(params, "terminal/wait_for_exit");
-		const exitCode = await terminal.waitPromise;
-		return { exitCode, signal: null };
-	}
-
-	private _handleAcpKillTerminal(params: Record<string, unknown>): null {
-		const method = "terminal/kill";
-		const terminal = this._requireAcpTerminal(params, method);
-		const signal = this._optionalAcpNumberParam(params, "signal", method) ?? 15;
-		terminal.handle.kill(Math.trunc(signal));
-		return null;
-	}
-
-	private _handleAcpReleaseTerminal(params: Record<string, unknown>): null {
-		const method = "terminal/release";
-		const terminalId = this._requireAcpStringParam(
-			params,
-			"terminalId",
-			method,
-		);
-		const terminal = this._acpTerminals.get(terminalId);
-		if (!terminal) {
-			throw new AcpDispatchError(
-				-32602,
-				`ACP terminal not found: ${terminalId}`,
-			);
-		}
-		if (terminal.exitCode === null) {
-			terminal.handle.kill();
-		}
-		this._acpTerminals.delete(terminalId);
-		return null;
-	}
-
-	private _handleAcpResizeTerminal(params: Record<string, unknown>): null {
-		const method = "terminal/resize";
-		const terminal = this._requireAcpTerminal(params, method);
-		const cols = this._optionalAcpNumberParam(params, "cols", method);
-		const rows = this._optionalAcpNumberParam(params, "rows", method);
-		if (cols === undefined || rows === undefined) {
-			throw new AcpDispatchError(
-				-32602,
-				`${method} requires numeric cols and rows`,
-			);
-		}
-		terminal.handle.resize(Math.trunc(cols), Math.trunc(rows));
-		return null;
-	}
-
-	onSessionEvent(handler: (entry: SessionStreamEntry) => void): () => void;
-	onSessionEvent(
-		sessionId: string | undefined,
-		handler: (entry: SessionStreamEntry) => void,
-	): () => void;
-	onSessionEvent(
-		sessionIdOrHandler:
-			| string
-			| ((entry: SessionStreamEntry) => void)
-			| undefined,
-		maybeHandler?: (entry: SessionStreamEntry) => void,
-	): () => void {
-		const sessionId =
-			typeof sessionIdOrHandler === "string" ? sessionIdOrHandler : "main";
-		const handler =
-			typeof sessionIdOrHandler === "function"
-				? sessionIdOrHandler
-				: maybeHandler;
-		if (!handler) {
-			throw new TypeError("onSessionEvent requires a handler");
-		}
-		const handlers =
-			this._durableSessionEventHandlers.get(sessionId) ?? new Set();
-		handlers.add(handler);
-		this._durableSessionEventHandlers.set(sessionId, handlers);
-		return () => {
-			handlers.delete(handler);
-			if (handlers.size === 0) {
-				this._durableSessionEventHandlers.delete(sessionId);
+					};
 			}
-		};
-	}
-
-	/** Subscribe to unexpected adapter exits without changing session liveness. */
-	onAgentExit(handler: AgentExitHandler): () => void;
-	onAgentExit(
-		sessionId: string | undefined,
-		handler: AgentExitHandler,
-	): () => void;
-	onAgentExit(
-		sessionIdOrHandler: string | AgentExitHandler | undefined,
-		maybeHandler?: AgentExitHandler,
-	): () => void {
-		const sessionId =
-			typeof sessionIdOrHandler === "string" ? sessionIdOrHandler : "*";
-		const handler =
-			typeof sessionIdOrHandler === "function"
-				? sessionIdOrHandler
-				: maybeHandler;
-		if (!handler) throw new TypeError("onAgentExit requires a handler");
-		const handlers = this._agentExitHandlers.get(sessionId) ?? new Set();
-		handlers.add(handler);
-		this._agentExitHandlers.set(sessionId, handlers);
-		return () => {
-			handlers.delete(handler);
-			if (handlers.size === 0) this._agentExitHandlers.delete(sessionId);
-		};
+		});
 	}
 
 	// ── Cron ────────────────────────────────────────────────────
@@ -6782,30 +5675,44 @@ export class AgentOs {
 
 	async dispose(): Promise<void> {
 		this._cronManager.dispose();
+		const errors: unknown[] = [];
 
-		for (const [id, entry] of this._shells) {
+		for (const entry of this._shells.values()) {
 			entry.handle.kill();
 		}
 		const shellExitPromises = [...this._pendingShellExitPromises];
+		const runningLanguageProcesses = [
+			...this._languageProcesses.entries(),
+		].filter(([, process]) => !process.exit);
+		const languageExitPromises = runningLanguageProcesses.map(
+			([, process]) =>
+				new Promise<void>((resolve) => {
+					const handleExit = () => {
+						process.exitHandlers.delete(handleExit);
+						resolve();
+					};
+					process.exitHandlers.add(handleExit);
+				}),
+		);
+		const languageKillResults = await Promise.allSettled(
+			runningLanguageProcesses.map(([pid]) => this._killProcess(pid)),
+		);
+		errors.push(
+			...languageKillResults.flatMap((result) =>
+				result.status === "rejected" ? [result.reason] : [],
+			),
+		);
+		await waitForTrackedExitPromises(
+			[...shellExitPromises, ...languageExitPromises],
+			VM_DISPOSE_DRAIN_TIMEOUT_MS,
+		);
+
 		this._shells.clear();
-		const terminalExitPromises: Promise<unknown>[] = [];
-		for (const terminal of this._acpTerminals.values()) {
-			terminal.handle.kill();
-			terminalExitPromises.push(
-				terminal.waitPromise.then(
-					() => undefined,
-					() => undefined,
-				),
-			);
-		}
-		this._acpTerminals.clear();
 		this._processes.clear();
+		this._languageProcesses.clear();
+		this._languageProcessIds.clear();
 		this._executionOutputHandlers.clear();
 		this._executionCompletedHandlers.clear();
-		await waitForTrackedExitPromises(
-			[...shellExitPromises, ...terminalExitPromises],
-			SHELL_DISPOSE_TIMEOUT_MS,
-		);
 
 		this._disposeSidecarEventListener();
 
@@ -6815,7 +5722,6 @@ export class AgentOs {
 			? sidecarLease.dispose()
 			: this.#kernel.dispose();
 		const hooks = this._disposeHooks.splice(0);
-		const errors: unknown[] = [];
 		try {
 			await disposeVm;
 		} catch (error) {

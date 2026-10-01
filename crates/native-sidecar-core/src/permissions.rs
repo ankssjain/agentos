@@ -98,24 +98,62 @@ pub fn default_permissions_policy() -> vm_config::PermissionsPolicy {
     }
 }
 
-/// Resolve a client's policy: each scope it sets replaces the default for that
-/// scope, and every scope it leaves out keeps the default. No policy at all
-/// means the default policy.
-pub fn resolve_permissions_policy(
-    requested: Option<&vm_config::PermissionsPolicy>,
-) -> vm_config::PermissionsPolicy {
-    let defaults = default_permissions_policy();
-    let Some(requested) = requested else {
-        return defaults;
-    };
-    vm_config::PermissionsPolicy {
-        fs: requested.fs.clone().or(defaults.fs),
-        network: requested.network.clone().or(defaults.network),
-        child_process: requested.child_process.clone().or(defaults.child_process),
-        process: requested.process.clone().or(defaults.process),
-        env: requested.env.clone().or(defaults.env),
-        host_function: requested.host_function.clone().or(defaults.host_function),
+/// Canonical agentOS VM policy used whenever an embedded or hosted client
+/// omits permission fields. It extends the VM-local default with the hosted
+/// LLM endpoint allowlist.
+pub fn agentos_default_permissions_policy() -> vm_config::PermissionsPolicy {
+    const EGRESS_HOSTS: &[&str] = &[
+        "api.anthropic.com",
+        "api.openai.com",
+        "generativelanguage.googleapis.com",
+        "openrouter.ai",
+    ];
+    let patterns = EGRESS_HOSTS
+        .iter()
+        .flat_map(|host| [format!("dns://{host}"), format!("tcp://{host}:*")])
+        .collect();
+    let mut policy = default_permissions_policy();
+    if let Some(vm_config::PatternPermissionScope::Rules(network)) = &mut policy.network {
+        network.rules.push(vm_config::PatternPermissionRule {
+            mode: vm_config::PermissionMode::Allow,
+            operations: vec![String::from("*")],
+            patterns,
+        });
     }
+    policy
+}
+
+/// Applies an optional field-by-field policy over the selected profile. This
+/// gives explicit partial permission objects the same defaults in every client.
+pub fn resolve_permissions_policy(
+    profile: vm_config::VmDefaultsProfile,
+    overrides: Option<vm_config::PermissionsPolicy>,
+) -> vm_config::PermissionsPolicy {
+    let mut resolved = match profile {
+        vm_config::VmDefaultsProfile::Secure => default_permissions_policy(),
+        vm_config::VmDefaultsProfile::AgentOs => agentos_default_permissions_policy(),
+    };
+    if let Some(overrides) = overrides {
+        if overrides.fs.is_some() {
+            resolved.fs = overrides.fs;
+        }
+        if overrides.network.is_some() {
+            resolved.network = overrides.network;
+        }
+        if overrides.child_process.is_some() {
+            resolved.child_process = overrides.child_process;
+        }
+        if overrides.process.is_some() {
+            resolved.process = overrides.process;
+        }
+        if overrides.env.is_some() {
+            resolved.env = overrides.env;
+        }
+        if overrides.host_function.is_some() {
+            resolved.host_function = overrides.host_function;
+        }
+    }
+    resolved
 }
 
 pub fn evaluate_permissions_policy(
@@ -487,7 +525,7 @@ mod tests {
 
     #[test]
     fn default_policy_is_a_sandboxed_vm() {
-        let policy = resolve_permissions_policy(None);
+        let policy = resolve_permissions_policy(vm_config::VmDefaultsProfile::Secure, None);
 
         assert!(allowed(&policy, "fs", "fs.read", "/workspace/a"));
         assert!(allowed(
@@ -549,7 +587,8 @@ mod tests {
             env: None,
             host_function: None,
         };
-        let policy = resolve_permissions_policy(Some(&requested));
+        let policy =
+            resolve_permissions_policy(vm_config::VmDefaultsProfile::Secure, Some(requested));
 
         assert!(allowed(
             &policy,
@@ -565,6 +604,56 @@ mod tests {
         ));
         assert!(allowed(&policy, "fs", "fs.write", "/workspace/a"));
         assert!(allowed(&policy, "env", "env.read", "HOME"));
+    }
+
+    #[test]
+    fn agentos_profile_materializes_defaults_and_merges_partial_overrides() {
+        let defaults = resolve_permissions_policy(vm_config::VmDefaultsProfile::AgentOs, None);
+        assert_eq!(
+            defaults.child_process,
+            Some(vm_config::PatternPermissionScope::Mode(
+                vm_config::PermissionMode::Allow
+            ))
+        );
+        let Some(vm_config::PatternPermissionScope::Rules(network)) = &defaults.network else {
+            panic!("agentOS network default must be an allowlist");
+        };
+        assert_eq!(network.default, Some(vm_config::PermissionMode::Deny));
+        assert_eq!(network.rules.len(), 3);
+        for expected in [
+            "dns://api.anthropic.com",
+            "tcp://api.anthropic.com:*",
+            "dns://api.openai.com",
+            "dns://generativelanguage.googleapis.com",
+            "dns://openrouter.ai",
+        ] {
+            assert!(network.rules[0]
+                .patterns
+                .iter()
+                .any(|value| value == expected));
+        }
+
+        let overridden = resolve_permissions_policy(
+            vm_config::VmDefaultsProfile::AgentOs,
+            Some(vm_config::PermissionsPolicy {
+                fs: None,
+                network: Some(vm_config::PatternPermissionScope::Mode(
+                    vm_config::PermissionMode::Deny,
+                )),
+                child_process: None,
+                process: None,
+                env: None,
+                host_function: None,
+            }),
+        );
+        assert_eq!(overridden.fs, defaults.fs);
+        assert_eq!(overridden.child_process, defaults.child_process);
+        assert_eq!(
+            overridden.network,
+            Some(vm_config::PatternPermissionScope::Mode(
+                vm_config::PermissionMode::Deny
+            ))
+        );
     }
 
     #[test]

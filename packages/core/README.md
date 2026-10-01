@@ -1,15 +1,15 @@
-# AgentOS runtime internals
+# agentOS embedded Core
 
-`@rivet-dev/agentos-core` is the shared runtime implementation used by the
-public AgentOS packages. It is published only as a transitive dependency and is
-not a supported user-facing install target.
+`@rivet-dev/agentos-core` embeds an agentOS VM in a Node.js application. The
+embedding process owns VM lifecycle and may supply trusted host bindings,
+host-backed mounts, and local `.aospkg` paths.
 
-Install the public package instead:
+Install Core directly for embedded use:
 
 ```sh
-# Actors, sessions, and the complete AgentOS SDK
-pnpm add @rivet-dev/agentos
+pnpm add @rivet-dev/agentos-core
 ```
 
-See the [AgentOS documentation](https://rivet.dev/agentos/docs) for supported
-APIs.
+Managed services can wrap Core with a transport-specific client. Those adapters
+live outside this repository and intentionally expose a smaller trusted-host
+surface.

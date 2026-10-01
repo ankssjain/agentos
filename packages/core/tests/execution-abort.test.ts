@@ -15,6 +15,10 @@ type ExecutionCompletedHandler = (event: {
 }) => void;
 
 type ExecutionAgent = {
+	_processes: Map<number, unknown>;
+	_languageProcesses: Map<number, unknown>;
+	_languageProcessIds: Map<string, number>;
+	_pendingProcessRegistrations: number;
 	_executionOutputHandlers: Map<string, Set<(event: unknown) => void>>;
 	_executionCompletedHandlers: Map<string, Set<ExecutionCompletedHandler>>;
 	_sidecarClient: {
@@ -25,11 +29,21 @@ type ExecutionAgent = {
 	_executionOperation(
 		payload: unknown,
 		options: { signal?: AbortSignal },
+		background?: boolean,
 	): Promise<CodeExecutionResult>;
+	_spawnLanguageOperation(
+		buildPayload: (options: unknown, executionId: string) => unknown,
+		options: { signal?: AbortSignal },
+		language: "javascript" | "python",
+	): Promise<{ pid: number }>;
 };
 
 function createExecutionAgent() {
 	const agent = Object.create(AgentOs.prototype) as ExecutionAgent;
+	agent._processes = new Map();
+	agent._languageProcesses = new Map();
+	agent._languageProcessIds = new Map();
+	agent._pendingProcessRegistrations = 0;
 	agent._executionOutputHandlers = new Map();
 	agent._executionCompletedHandlers = new Map();
 	agent._sidecarSession = {};
@@ -144,5 +158,31 @@ describe("AgentOs execution abort", () => {
 			agent._sidecarVm,
 			{ type: "cancel_execution", request: { executionId: EXECUTION_ID } },
 		);
+	});
+
+	it("registers one abort listener for a spawned language process", async () => {
+		const agent = createExecutionAgent();
+		const controller = new AbortController();
+		const addEventListener = vi.spyOn(controller.signal, "addEventListener");
+
+		const process = await agent._spawnLanguageOperation(
+			() => ({ type: "javascript_execution" }),
+			{ signal: controller.signal },
+			"javascript",
+		);
+
+		expect(process.pid).toBe(123);
+		expect(
+			addEventListener.mock.calls.filter(([type]) => type === "abort"),
+		).toHaveLength(1);
+
+		for (const handler of agent._executionCompletedHandlers.get("*") ?? []) {
+			handler({
+				executionId: EXECUTION_ID,
+				generation: 1,
+				outcome: "cancelled",
+			});
+		}
+		await Promise.resolve();
 	});
 });

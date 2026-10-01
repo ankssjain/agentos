@@ -24,10 +24,9 @@ use std::path::{Path, PathBuf};
 
 use crate::state::SidecarError;
 use vfs::package_format::pack::{
-    command_targets_from_package_json, is_projectable_command_name, manifest_json_to_v1,
-    SNAPSHOT_BUNDLE_PATH,
+    command_targets_from_package_json, is_projectable_command_name, manifest_json_to_v2,
 };
-use vfs::package_format::{generated::v1, read_manifest_chunk_from_file};
+use vfs::package_format::{generated::v2, read_manifest_chunk_from_file};
 use vfs::posix::{normalize_path, TarFileSystem, VirtualFileSystem};
 
 /// Root of the agentOS package tree inside the VM.
@@ -37,23 +36,16 @@ pub const OPT_AGENTOS_BIN: &str = "/opt/agentos/bin";
 pub const DEFAULT_PACKAGE_FILE_NAME: &str = "package.aospkg";
 /// Back-compat alias for the packed container file name.
 pub const DEFAULT_PACKAGE_TAR_NAME: &str = DEFAULT_PACKAGE_FILE_NAME;
-pub const MAX_AGENTOS_PACKAGE_MOUNTS: usize = 4096;
+pub const MAX_AGENTOS_PACKAGE_MOUNTS: usize =
+    agentos_native_sidecar_core::limits::DEFAULT_AGENTOS_PACKAGE_MAX_MOUNTS;
 
 /// A package to project, derived from chunk1 of `package.aospkg`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageDescriptor {
     pub name: String,
     pub version: String,
     pub dir: String,
     pub tar_path: Option<String>,
-    /// `bin/` command that speaks ACP, if this is an agent package.
-    pub acp_entrypoint: Option<String>,
-    /// Agent launch env from the packed manifest's agent block.
-    pub agent_env: HashMap<String, String>,
-    /// Agent launch args from the packed manifest's agent block.
-    pub agent_launch_args: Vec<String>,
-    pub snapshot: bool,
-    pub snapshot_bundle_path: Option<String>,
     pub provides: Option<PackageProvidesDescriptor>,
     pub commands: Vec<PackageCommandTarget>,
     pub man_pages: Vec<PackageManPageTarget>,
@@ -88,13 +80,13 @@ pub enum PackageLeafMount {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageProvidesDescriptor {
     pub env: HashMap<String, String>,
     pub files: Vec<PackageProvidesFileDescriptor>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageProvidesFileDescriptor {
     pub source: String,
     pub target: String,
@@ -104,7 +96,7 @@ impl PackageDescriptor {
     fn from_manifest(
         dir: String,
         tar_path: Option<String>,
-        manifest: v1::PackageManifest,
+        manifest: v2::PackageManifest,
     ) -> Result<Self, SidecarError> {
         if manifest.name.is_empty() {
             return Err(SidecarError::InvalidState(format!(
@@ -116,33 +108,11 @@ impl PackageDescriptor {
                 "package manifest in {dir} is missing a valid \"version\""
             )));
         }
-        let (acp_entrypoint, agent_env, agent_launch_args, snapshot) = match manifest.agent {
-            Some(agent) => (
-                Some(agent.acp_entrypoint),
-                agent.env,
-                agent.launch_args,
-                agent.snapshot,
-            ),
-            None => (None, HashMap::new(), Vec::new(), false),
-        };
-        if acp_entrypoint
-            .as_ref()
-            .is_some_and(|entry| entry.is_empty())
-        {
-            return Err(SidecarError::InvalidState(format!(
-                "package manifest in {dir} has an empty agent.acpEntrypoint"
-            )));
-        }
         Ok(Self {
             name: manifest.name,
             version: manifest.version,
             dir,
             tar_path,
-            acp_entrypoint,
-            agent_env,
-            agent_launch_args,
-            snapshot,
-            snapshot_bundle_path: manifest.snapshot_bundle_path,
             provides: manifest.provides.map(convert_provides),
             commands: manifest
                 .commands
@@ -168,7 +138,7 @@ impl PackageDescriptor {
     }
 }
 
-fn convert_provides(provides: v1::ProvidesBlock) -> PackageProvidesDescriptor {
+fn convert_provides(provides: v2::ProvidesBlock) -> PackageProvidesDescriptor {
     PackageProvidesDescriptor {
         env: provides.env,
         files: provides
@@ -209,35 +179,24 @@ fn read_package_manifest_from_dir(dir: &str) -> Result<PackageDescriptor, Sideca
         )));
     }
     let manifest_json = fs::read(&path).map_err(|e| io_err("read agentos-package.json", e))?;
-    let snapshot_declared = serde_json::from_slice::<serde_json::Value>(&manifest_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("agent")
-                .and_then(|agent| agent.get("snapshot"))
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(false);
-    let snapshot_bundle_path = snapshot_declared.then(|| SNAPSHOT_BUNDLE_PATH.to_owned());
     let commands = command_targets_from_dir(dir)?;
     let man_pages = man_pages_from_dir(dir)?;
-    let manifest = manifest_json_to_v1(
+    let manifest = manifest_json_to_v2(
         &manifest_json,
         commands
             .into_iter()
-            .map(|target| v1::CommandTarget {
+            .map(|target| v2::CommandTarget {
                 command: target.command,
                 entry: target.entry,
             })
             .collect(),
         man_pages
             .into_iter()
-            .map(|page| v1::ManPage {
+            .map(|page| v2::ManPage {
                 section: page.section,
                 page: page.page,
             })
             .collect(),
-        snapshot_bundle_path,
     )
     .map_err(|error| {
         SidecarError::InvalidState(format!("invalid agentos-package.json in {dir}: {error}"))
@@ -311,36 +270,6 @@ fn man_pages_from_dir(dir: &str) -> Result<Vec<PackageManPageTarget>, SidecarErr
     Ok(pages)
 }
 
-/// Read the first snapshot-enabled agent package's bundled SDK snapshot source from `.aospkg`.
-pub fn read_agent_snapshot_bundle(
-    package: &PackageDescriptor,
-) -> Result<Option<String>, SidecarError> {
-    if !package.snapshot {
-        return Ok(None);
-    }
-    let Some(path) = package.snapshot_bundle_path.as_deref() else {
-        return Ok(None);
-    };
-    let Some(tar_path) = package.tar_ref() else {
-        let host_path = Path::new(&package.dir).join(path.trim_start_matches('/'));
-        if !host_path.exists() {
-            return Ok(None);
-        }
-        return fs::read_to_string(&host_path)
-            .map(Some)
-            .map_err(|e| io_err("read agent snapshot bundle", e));
-    };
-    let mut fs = TarFileSystem::open(tar_path)
-        .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
-    match fs.read_file(path) {
-        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|error| {
-            SidecarError::InvalidState(format!("snapshot bundle is not UTF-8: {error}"))
-        }),
-        Err(error) if error.code() == "ENOENT" => Ok(None),
-        Err(error) => Err(SidecarError::InvalidState(error.to_string())),
-    }
-}
-
 fn package_tar_for_dir(dir: &str) -> Option<PathBuf> {
     let tar = Path::new(dir).join(DEFAULT_PACKAGE_TAR_NAME);
     tar.is_file().then_some(tar)
@@ -366,6 +295,11 @@ pub fn read_package_manifest_from_path(path: &str) -> Result<PackageDescriptor, 
             .unwrap_or_else(|| path.to_owned());
         return read_package_manifest_from_tar_with_dir(fs_path, dir);
     }
+    if !fs_path.exists() {
+        return Err(SidecarError::InvalidState(format!(
+            "package path {path} does not exist"
+        )));
+    }
     read_package_manifest(path)
 }
 
@@ -380,7 +314,7 @@ fn read_package_manifest_from_tar_with_dir(
     PackageDescriptor::from_manifest(dir, Some(tar.to_string_lossy().into_owned()), manifest)
 }
 
-fn read_aospkg_manifest_chunk(path: &Path) -> Result<v1::PackageManifest, SidecarError> {
+fn read_aospkg_manifest_chunk(path: &Path) -> Result<v2::PackageManifest, SidecarError> {
     // Container framing lives in vfs::package_format; this is the single
     // startup-critical chunk1 read shared with every host-side consumer.
     read_manifest_chunk_from_file(path)
@@ -391,25 +325,19 @@ pub fn build_package_leaf_mounts(
     packages: &[PackageDescriptor],
     mount_at: &str,
 ) -> Result<Vec<PackageLeafMount>, SidecarError> {
+    build_package_leaf_mounts_with_limit(packages, mount_at, MAX_AGENTOS_PACKAGE_MOUNTS)
+}
+
+pub fn build_package_leaf_mounts_with_limit(
+    packages: &[PackageDescriptor],
+    mount_at: &str,
+    max_mounts: usize,
+) -> Result<Vec<PackageLeafMount>, SidecarError> {
     let mount_at = normalize_mount_root(mount_at);
     let mut mounts = Vec::new();
     let mut command_paths = HashSet::new();
 
     for package in packages {
-        let commands = package
-            .commands
-            .iter()
-            .map(|target| target.command.clone())
-            .collect::<Vec<_>>();
-        if let Some(acp) = &package.acp_entrypoint {
-            if !commands.contains(acp) {
-                return Err(SidecarError::InvalidState(format!(
-                    "agent acpEntrypoint {acp:?} is not one of {}'s commands",
-                    package.name
-                )));
-            }
-        }
-
         let package_root = package_guest_root(&mount_at, &package.name);
         let version_path = normalize_path(&format!("{package_root}/{}", package.version));
         if let Some(tar_path) = package.tar_ref() {
@@ -420,6 +348,7 @@ pub fn build_package_leaf_mounts(
                     tar_path: tar_path.to_owned(),
                     root: String::from("/"),
                 },
+                max_mounts,
             )?;
         } else {
             push_mount(
@@ -428,6 +357,7 @@ pub fn build_package_leaf_mounts(
                     guest_path: version_path,
                     host_path: package.dir.clone(),
                 },
+                max_mounts,
             )?;
         }
         push_mount(
@@ -436,6 +366,7 @@ pub fn build_package_leaf_mounts(
                 guest_path: normalize_path(&format!("{package_root}/current")),
                 target: package.version.clone(),
             },
+            max_mounts,
         )?;
 
         for target in &package.commands {
@@ -452,6 +383,7 @@ pub fn build_package_leaf_mounts(
                     guest_path,
                     target: format!("../pkgs/{}/current/{}", package.name, target.entry),
                 },
+                max_mounts,
             )?;
         }
 
@@ -468,6 +400,7 @@ pub fn build_package_leaf_mounts(
                         package.name, page.section, page.page
                     ),
                 },
+                max_mounts,
             )?;
         }
     }
@@ -520,22 +453,15 @@ pub fn package_provides_file_mount(
 fn push_mount(
     mounts: &mut Vec<PackageLeafMount>,
     mount: PackageLeafMount,
+    max_mounts: usize,
 ) -> Result<(), SidecarError> {
     let observed = mounts.len() + 1;
-    if observed > MAX_AGENTOS_PACKAGE_MOUNTS {
-        return Err(SidecarError::InvalidState(format!(
-            "agentos package mount count exceeded: {observed} mounts > {MAX_AGENTOS_PACKAGE_MOUNTS} mounts (raise via limits.agentosPackages.maxMounts)"
-        )));
-    }
-    if observed * 100 / MAX_AGENTOS_PACKAGE_MOUNTS >= 80 {
-        tracing::warn!(
-            limit = "agentos_package_mounts",
-            observed,
-            capacity = MAX_AGENTOS_PACKAGE_MOUNTS,
-            fill_percent = observed * 100 / MAX_AGENTOS_PACKAGE_MOUNTS,
-            wired = "limits.agentosPackages.maxMounts",
-            "agentos package mount count approaching configured limit"
-        );
+    if observed > max_mounts {
+        return Err(SidecarError::PackageMountLimit {
+            used: 0,
+            requested: observed,
+            limit: max_mounts,
+        });
     }
     mounts.push(mount);
     Ok(())

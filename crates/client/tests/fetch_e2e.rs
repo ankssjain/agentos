@@ -1,4 +1,4 @@
-//! Port-based virtual `fetch` e2e against a real `agentos-sidecar`.
+//! Port-based virtual `fetch` e2e against a real `agentos-native-sidecar`.
 //!
 //! `fetch` dispatches to a guest HTTP server listening on a port INSIDE the kernel (never the host).
 //! Standing up that guest listener requires the V8/JS guest runtime, which may be broken in this
@@ -49,7 +49,7 @@ async fn fetch_tolerant(
                 )
             })
             .collect(),
-        body: Some(body.to_vec()),
+        body: Some(body.to_vec().into()),
     };
     let handle = tokio::spawn(async move {
         let response = os.http_request(request).await?;
@@ -95,7 +95,7 @@ async fn fetch_tolerant_with_timeout(
                 )
             })
             .collect(),
-        body: Some(body.to_vec()),
+        body: Some(body.to_vec().into()),
     };
     let mut handle = tokio::spawn(async move {
         let response = os.http_request(request).await?;

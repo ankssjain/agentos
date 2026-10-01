@@ -46,23 +46,13 @@ jobs:
             npx turbo build \
               --only \
               --concurrency=4 \
-              --filter='!@agentos-software/codex' \
-              --filter='!@rivet-dev/agentos-browser' \
-              --filter='!@rivet-dev/agentos-runtime-browser' \
-              --filter='!@rivet-dev/agentos-playground'
+              --filter='!@rivet-dev/agentos-runtime-browser'
           else
             npx turbo build \
               --only \
               --concurrency=4 \
-              --filter='!@agentos-software/codex' \
-              --filter='!@rivet-dev/agentos-browser' \
-              --filter='!@rivet-dev/agentos-runtime-browser' \
-              --filter='!@rivet-dev/agentos-playground'
+              --filter='!@rivet-dev/agentos-runtime-browser'
           fi
-      # The Codex adapter is ordinary TypeScript, while its executable is a
-      # reproducibly built 56 MB WASI artifact. Keep the cheap PR lane source-only;
-      # nightly and publish workflows build the pinned executable explicitly.
-      - run: pnpm --dir software/codex check-types
       - run: pnpm --dir scripts/publish run check-types
       - run: pnpm --dir scripts/publish test
       - run: node --test scripts/check-rust-package-metadata.test.mjs
@@ -92,8 +82,7 @@ jobs:
             --exclude='software/*/dist/package.tar' \
             --exclude='software/*/dist/package.aospkg' \
             -czf /tmp/agentos-js-dist.tar.gz \
-            packages/*/dist software/*/dist test-harness/dist \
-            packages/agentos/assets/inspector-tabs-app
+            packages/*/dist software/*/dist test-harness/dist
       - uses: actions/upload-artifact@v4
         with:
           name: js-dist
@@ -157,18 +146,17 @@ jobs:
         run: |
           cargo test -p agentos-vm-config --quiet
           git diff --exit-code -- packages/runtime-core/src/generated
-      - name: Build PR sidecar binaries
-        run: cargo build -p agentos-sidecar -p agentos-native-sidecar
-      - run: cargo clippy --workspace --exclude agentos-sidecar-browser --exclude agentos-native-sidecar-browser --all-targets -- -D warnings
-      - run: cargo test -p agentos-protocol -p agentos-sidecar -- --test-threads=1
+      - name: Build PR sidecar binary
+        run: cargo build -p agentos-native-sidecar
+      - run: cargo clippy --workspace --exclude agentos-native-sidecar-browser --all-targets -- -D warnings
       - name: Test Rust client contracts
         env:
-          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/target/debug/agentos-sidecar
+          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/target/debug/agentos-native-sidecar
         run: |
           cargo test -p agentos-client \
+            --features service-internals \
             --lib \
             --test scaffold \
-            --test session_event_types \
             --test e2e_smoke \
             --test fs_e2e \
             --test lifecycle_e2e \
@@ -176,20 +164,13 @@ jobs:
             --test sidecar_pool_e2e \
             --test cron_e2e \
             --test cron_grammar_e2e \
+            --test vm_config_compare_e2e \
             -- --test-threads=1
       - name: Stage stripped sidecar artifacts
         run: |
-          mkdir -p ci-artifacts/agentos-sidecar ci-artifacts/agentos-native-sidecar
-          cp target/debug/agentos-sidecar ci-artifacts/agentos-sidecar/agentos-sidecar
+          mkdir -p ci-artifacts/agentos-native-sidecar
           cp target/debug/agentos-native-sidecar ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
-          strip --strip-all ci-artifacts/agentos-sidecar/agentos-sidecar
           strip --strip-all ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agentos-sidecar
-          path: ci-artifacts/agentos-sidecar/agentos-sidecar
-          retention-days: 1
-          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: agentos-native-sidecar
@@ -219,8 +200,8 @@ jobs:
           path: ci-artifacts/js
       - uses: actions/download-artifact@v4
         with:
-          name: agentos-sidecar
-          path: ci-artifacts/agentos-sidecar
+          name: agentos-native-sidecar
+          path: ci-artifacts/agentos-native-sidecar
       - uses: actions/download-artifact@v4
         with:
           name: wasm-commands
@@ -228,15 +209,15 @@ jobs:
       - name: Restore runtime inputs
         run: |
           tar -xzf ci-artifacts/js/agentos-js-dist.tar.gz
-          chmod +x ci-artifacts/agentos-sidecar/agentos-sidecar
+          chmod +x ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
           node packages/runtime-core/scripts/copy-wasm-commands.mjs --require-coreutils
           pnpm --filter @agentos-software/coreutils build:runtime
       - run: pnpm --dir packages/core test:pr
         env:
-          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-sidecar/agentos-sidecar
+          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
       - run: pnpm --dir secure-exec test
         env:
-          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-sidecar/agentos-sidecar
+          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
 
   runtime-core-pr:
     name: Runtime Core PR
@@ -275,48 +256,10 @@ jobs:
         env:
           AGENTOS_NATIVE_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-native-sidecar/agentos-native-sidecar
 
-  actor-pr:
-    name: Actor Conformance
-    if: github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'aggregate-ci')
-    needs: [checks, rust, wasm-commands]
-    runs-on: ubuntu-latest
-    env:
-      AGENTOS_SKIP_NATIVE_META_BUILD: '1'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter '@rivet-dev/agentos...'
-      - uses: actions/download-artifact@v4
-        with:
-          name: js-dist
-          path: ci-artifacts/js
-      - uses: actions/download-artifact@v4
-        with:
-          name: agentos-sidecar
-          path: ci-artifacts/agentos-sidecar
-      - uses: actions/download-artifact@v4
-        with:
-          name: wasm-commands
-          path: packages/runtime-core/commands
-      - name: Restore runtime inputs
-        run: |
-          tar -xzf ci-artifacts/js/agentos-js-dist.tar.gz
-          chmod +x ci-artifacts/agentos-sidecar/agentos-sidecar
-          node packages/runtime-core/scripts/copy-wasm-commands.mjs --require-coreutils
-          pnpm --filter @agentos-software/coreutils build:runtime
-      - run: pnpm --dir packages/agentos test:pr
-        env:
-          AGENTOS_SIDECAR_BIN: ${{ github.workspace }}/ci-artifacts/agentos-sidecar/agentos-sidecar
-
   required:
     name: CI / Required
     if: ${{ always() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'aggregate-ci')) }}
-    needs: [checks, wasm-commands, rust, core-pr, runtime-core-pr, actor-pr]
+    needs: [checks, wasm-commands, rust, core-pr, runtime-core-pr]
     runs-on: ubuntu-latest
     steps:
       - name: Require every PR gate
@@ -326,15 +269,13 @@ jobs:
           RUST_RESULT: ${{ needs.rust.result }}
           CORE_RESULT: ${{ needs.core-pr.result }}
           RUNTIME_CORE_RESULT: ${{ needs.runtime-core-pr.result }}
-          ACTOR_RESULT: ${{ needs.actor-pr.result }}
         run: |
           for result in \
             "$CHECKS_RESULT" \
             "$WASM_RESULT" \
             "$RUST_RESULT" \
             "$CORE_RESULT" \
-            "$RUNTIME_CORE_RESULT" \
-            "$ACTOR_RESULT"; do
+            "$RUNTIME_CORE_RESULT"; do
             if [ "$result" != success ]; then
               echo "required CI job did not succeed: $result" >&2
               exit 1

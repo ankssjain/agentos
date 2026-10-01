@@ -138,7 +138,7 @@ export interface NodeRuntimeCreateOptions<
 	user?: VmUserConfig;
 	/**
 	 * Permission policy for the VM, merged over the sidecar's default: the
-	 * virtual filesystem, processes, environment, bindings, listeners, and
+	 * virtual filesystem, processes, environment, host functions, listeners, and
 	 * loopback networking work, while external network access is denied. A partial
 	 * policy works: `{ network: "allow" }` grants external access and keeps every
 	 * other scope at its default.
