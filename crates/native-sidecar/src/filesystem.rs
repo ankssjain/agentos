@@ -940,6 +940,11 @@ where
                         vm.kernel
                             .write_file(&path, bytes.clone())
                             .map_err(kernel_error)?;
+                        // Mounts own their writes; do not introduce an extra
+                        // backend realpath/metadata requirement after success.
+                        if is_non_root_mount_path(&vm.kernel, &path) {
+                            return Ok(PythonVfsRpcResponsePayload::Empty);
+                        }
                         // Python's VFS bridge writes complete file contents to the
                         // kernel. Keep the root staging copy current too, otherwise
                         // exit/read-side reconciliation imports API-seeded old bytes.
